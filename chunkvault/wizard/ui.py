@@ -216,9 +216,11 @@ def select_archives(
 ) -> list:
     """Multi-select checkbox over archives. Returns the filtered list.
 
-    Pre-checks all archives where the preview looks clean (no error AND at
-    least one server with regions). Lets the user uncheck individual ones.
-    Returns the user's selection (empty list if cancelled).
+    NOTHING is pre-checked. With dozens of archives, accidentally accepting
+    a default-all selection (and then waiting for terabytes of ingest) is
+    too easy. Users press ``a`` to select all if that's what they want, or
+    Space to toggle individual ones. Returns the user's selection (empty
+    list if cancelled).
     """
     import questionary
     choices = []
@@ -226,10 +228,8 @@ def select_archives(
         # Build a single-line label that fits in a terminal
         if preview.error:
             tag = f"[error: {preview.error[:30]}]"
-            checked = False
         elif not preview.servers:
             tag = "[no servers]"
-            checked = False
         else:
             servers_summary = ", ".join(
                 f"{s.name}({s.region_files}r)" for s in preview.servers
@@ -237,15 +237,15 @@ def select_archives(
             if len(servers_summary) > 60:
                 servers_summary = servers_summary[:57] + "…"
             tag = servers_summary
-            # Pre-check only "clean" archives (every server has regions)
-            checked = all(s.region_files > 0 for s in preview.servers)
         label = f"{archive.name}  │ {tag}"
-        choices.append(questionary.Choice(label, value=archive, checked=checked))
+        choices.append(questionary.Choice(label, value=archive, checked=False))
     answer = questionary.checkbox(
-        "Select archives to ingest (Space toggles, Enter confirms):",
+        "Select archives to ingest:",
         choices=choices,
         style=_QSTYLE,
-        instruction="(↑↓ move, Space toggle, a all, i invert, Enter accept)",
+        instruction=(
+            "(↑↓ move • Space toggle • a select-all • i invert • Enter accept)"
+        ),
     ).ask()
     return list(answer) if answer is not None else []
 
