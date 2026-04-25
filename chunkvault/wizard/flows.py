@@ -209,13 +209,53 @@ def run_ingest_flow(
     from ..store.repo import RoundTripVerificationError
     with progress:
         archive_task = progress.add_task("archives", total=len(archives))
+        # A second task that follows the active phase inside the current
+        # archive (regions/files/verify). Without this the outer bar sits at
+        # 0/N for the entire first archive — a single 2 GB zip can take 10+
+        # minutes, and a frozen-looking progress bar makes users think
+        # the wizard hung.
+        phase_task = progress.add_task("phase: idle", total=None)
+
+        def make_cb():
+            """Translate ingest progress events into rich progress updates.
+
+            Tracks which phase is active; updates either total (on phase_start)
+            or current (on phase_progress) on the same phase_task.
+            """
+            def cb(e: ProgressEvent):
+                if e.kind == "phase_start":
+                    progress.update(
+                        phase_task,
+                        description=f"phase: {e.phase} {e.label or ''}".strip(),
+                        completed=0,
+                        total=e.total if e.total else None,
+                    )
+                elif e.kind == "phase_progress":
+                    progress.update(
+                        phase_task,
+                        completed=e.current,
+                        total=e.total if e.total else None,
+                    )
+                elif e.kind == "phase_done":
+                    progress.update(
+                        phase_task,
+                        completed=e.current or e.total or 0,
+                        total=e.total or e.current or None,
+                    )
+            return cb
+
         for archive in archives:
             progress.update(archive_task, description=f"archives: {archive.name}")
+            progress.update(
+                phase_task, description=f"phase: opening {archive.name}",
+                completed=0, total=None,
+            )
             try:
                 result = ingest_archive(
                     repo, archive,
                     skip_logs=skip_logs,
                     verify_roundtrip=verify_after,
+                    progress_cb=make_cb(),
                 )
                 results.append(result)
             except RoundTripVerificationError as e:
@@ -229,6 +269,7 @@ def run_ingest_flow(
             except Exception as e:
                 console.print(f"[red]error[/red] {archive.name}: {e}")
             progress.advance(archive_task, 1)
+        progress.update(phase_task, description="phase: done", completed=1, total=1)
 
     # Summary
     snaps = sum(len(r.snapshots) for r in results)
