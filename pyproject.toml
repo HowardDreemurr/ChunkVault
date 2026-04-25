@@ -9,6 +9,7 @@ description = "Cross-version incremental backup library for Minecraft Java world
 requires-python = ">=3.11"
 dependencies = [
     "Pillow>=10.0",
+    "rich>=13.0",
 ]
 
 [project.scripts]
