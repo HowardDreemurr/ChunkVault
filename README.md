@@ -12,7 +12,7 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-[![tests](https://img.shields.io/badge/tests-346%20passing-brightgreen)]() [![python](https://img.shields.io/badge/python-3.11%2B-blue)]() [![license](https://img.shields.io/badge/license-MIT-lightgrey)]()
+[![tests](https://img.shields.io/badge/tests-464%20passing-brightgreen)]() [![python](https://img.shields.io/badge/python-3.11%2B-blue)]() [![license](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 
 ---
 
@@ -386,7 +386,11 @@ chunkvault stitches together the parts these projects do well — MCA awareness 
 
 ## License
 
-MIT. See `LICENSE`.
+Apache License 2.0. See [`LICENSE`](LICENSE) for the full text and
+[`NOTICE`](NOTICE) for the attribution requirement that Section 4(d)
+imposes on any redistribution. Commercial use is permitted; the
+attribution notice (the `NOTICE` file) must travel with any
+redistribution or derivative work.
 
 ---
 

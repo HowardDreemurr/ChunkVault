@@ -7,6 +7,11 @@ name = "chunkvault"
 version = "0.0.1"
 description = "Cross-version incremental backup library for Minecraft Java worlds with chunk-level diff"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+    {name = "Howard Cui"},
+]
 dependencies = [
     "Pillow>=10.0",
     "rich>=13.0",
@@ -18,6 +23,7 @@ chunkvault = "chunkvault.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["chunkvault"]
+include = ["LICENSE", "NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
