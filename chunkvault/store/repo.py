@@ -330,6 +330,12 @@ class ChunkSnapshotRepo:
             ))
 
             # 2) Non-region files — whole-file dedup
+            # Walking a TB-scale world tree can take minutes by itself; emit
+            # an info phase so the bar isn't blank during the scan.
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="scan_files",
+                label="walking world tree for non-region files",
+            ))
             files_to_process = []
             for abs_path in _walk_world_files(world):
                 if abs_path in visited_paths:
@@ -338,6 +344,10 @@ class ChunkSnapshotRepo:
                 if _matches_any(rel, exclude_patterns):
                     continue
                 files_to_process.append((abs_path, rel))
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="scan_files",
+                label=f"found {len(files_to_process)} files",
+            ))
             _emit(progress_cb, ProgressEvent(
                 kind="phase_start", phase="files",
                 label="non-region files", total=len(files_to_process),
@@ -370,13 +380,25 @@ class ChunkSnapshotRepo:
             #    or delete it.
             snap_id = uuid.uuid4().hex
             manifest_path = self.manifests_dir / f"{snap_id}.mcbk"
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="write_manifest",
+                label=f"{manifest_path.name} ({chunk_count} chunks)",
+            ))
             write_manifest(manifest_path, manifest)
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="write_manifest",
+            ))
 
             # 4) Now do the index work — refs FIRST, snapshot row LAST.
             #    The snapshot row is the visibility marker: a row in the
             #    snapshots table only ever appears when refs are already
             #    correctly incremented. fsck uses the row's presence as
             #    proof that refs were committed.
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="update_index",
+                label=f"refcount {len(chunks_referenced)} chunks "
+                      f"+ {len(files_referenced)} files",
+            ))
             index.adjust_chunk_refs(chunks_referenced, delta=1)
             index.adjust_file_refs(files_referenced, delta=1)
             index.add_snapshot(SnapshotRow(
@@ -392,6 +414,9 @@ class ChunkSnapshotRepo:
                 file_count=file_count,
                 new_chunk_count=new_chunks,
                 new_file_count=new_files,
+            ))
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="update_index",
             ))
 
         _emit(progress_cb, ProgressEvent(
@@ -503,7 +528,15 @@ class ChunkSnapshotRepo:
         snapshot: ChunkSnapshot | str,
         dest: Path | str,
         paths: Iterable[str] | None = None,
+        *,
+        progress_cb: ProgressCallback = None,
     ) -> None:
+        """Re-materialize a snapshot to ``dest``.
+
+        Emits ``restore_regions`` then ``restore_files`` phases so the caller's
+        progress bar can show real movement: a TB-scale world's restore can
+        take hours, and a bar that reads "0/?" the whole time looks frozen.
+        """
         snap = snapshot if isinstance(snapshot, ChunkSnapshot) else self.get(snapshot)
         if snap is None:
             raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
@@ -513,8 +546,19 @@ class ChunkSnapshotRepo:
         manifest = read_manifest(snap.manifest_path)
         path_filter = set(paths) if paths is not None else None
 
+        total_regions = sum(len(rs) for rs in manifest.dimensions.values())
+        total_files = len(manifest.files)
+
+        if total_regions:
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="restore_regions",
+                label=f"{total_regions} region files → {dest_path.name}",
+                total=total_regions,
+            ))
+        region_i = 0
         for dim_key, regions in manifest.dimensions.items():
             for region in regions:
+                region_i += 1
                 rel = f"{dim_key}/r.{region.rx}.{region.rz}.mca"
                 if path_filter is not None and not _path_matches_filter(rel, path_filter):
                     # Restore the .mca even if the filter targets only an mcc
@@ -525,13 +569,40 @@ class ChunkSnapshotRepo:
                             path_filter,
                         ) for c in region.chunks if c.external
                     ):
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="restore_regions",
+                            label=f"skip {rel}",
+                            current=region_i, total=total_regions,
+                        ))
                         continue
                 self._restore_region(dest_path, dim_key, region, path_filter)
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="restore_regions",
+                    label=rel, current=region_i, total=total_regions,
+                ))
+        if total_regions:
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="restore_regions",
+                current=total_regions, total=total_regions,
+            ))
 
+        if total_files:
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="restore_files",
+                label=f"{total_files} non-region files",
+                total=total_files,
+            ))
+        file_i = 0
         for f in manifest.files:
+            file_i += 1
             if path_filter is not None and not _path_matches_filter(
                 f.relative_path, path_filter,
             ):
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="restore_files",
+                    label=f"skip {f.relative_path}",
+                    current=file_i, total=total_files,
+                ))
                 continue
             content = self.chunks.read_file(f.sha256)
             if content is None:
@@ -541,6 +612,16 @@ class ChunkSnapshotRepo:
             target = dest_path / f.relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_progress", phase="restore_files",
+                label=f.relative_path,
+                current=file_i, total=total_files,
+            ))
+        if total_files:
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="restore_files",
+                current=total_files, total=total_files,
+            ))
 
     def _restore_region(
         self, dest_root: Path, dim_key: str,
@@ -643,20 +724,38 @@ class ChunkSnapshotRepo:
 
     # ---- verify -----------------------------------------------------------
 
-    def verify(self, *, repair: bool = False) -> "VerifyReport":
+    def verify(
+        self,
+        *,
+        repair: bool = False,
+        progress_cb: ProgressCallback = None,
+    ) -> "VerifyReport":
         """Walk every blob on disk, recompute its hash, compare to its name.
 
         Also cross-checks that every chunk/file referenced by some manifest
         actually exists in the pool. With ``repair=True``, corrupt blobs are
         deleted; reachable-but-missing blobs are reported but never re-created
         (we have no way to conjure them).
+
+        Emits four phases — ``verify_chunks``, ``verify_files``,
+        ``verify_reachability``, ``verify_orphans`` — each with per-blob
+        progress (batched every 100 to keep callback overhead negligible
+        when scanning millions of blobs).
         """
         report = VerifyReport()
+        BATCH = 100   # emit phase_progress every N items; finer feels jittery,
+                      # coarser hides progress on small vaults
 
         # 1) Byte-level integrity — chunks store (masked_compression || payload),
         #    which is exactly what hash_chunk hashed; so blake2b of the file
         #    must equal the path-encoded hash.
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="verify_chunks",
+            label="re-hashing chunk pool",
+        ))
+        i = 0
         for path, expected in _iter_pool_blobs(self.chunks.chunks_dir):
+            i += 1
             content = path.read_bytes()
             actual = hashlib.blake2b(content, digest_size=16).digest()
             if actual == expected:
@@ -669,9 +768,26 @@ class ChunkSnapshotRepo:
                         report.repaired += 1
                     except OSError:
                         pass
+            if i % BATCH == 0:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="verify_chunks",
+                    label=f"{report.ok_chunks} ok, {report.corrupt_chunks} corrupt",
+                    current=i,
+                ))
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="verify_chunks",
+            current=i, total=i,
+            detail={"ok": report.ok_chunks, "corrupt": report.corrupt_chunks},
+        ))
 
         # Files: keyed by sha256 of full content.
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="verify_files",
+            label="re-hashing file pool",
+        ))
+        i = 0
         for path, expected in _iter_pool_blobs(self.chunks.files_dir):
+            i += 1
             content = path.read_bytes()
             actual = hashlib.sha256(content).digest()
             if actual == expected:
@@ -684,15 +800,37 @@ class ChunkSnapshotRepo:
                         report.repaired += 1
                     except OSError:
                         pass
+            if i % BATCH == 0:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="verify_files",
+                    label=f"{report.ok_files} ok, {report.corrupt_files} corrupt",
+                    current=i,
+                ))
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="verify_files",
+            current=i, total=i,
+            detail={"ok": report.ok_files, "corrupt": report.corrupt_files},
+        ))
 
         # 2) Reachability — any hash referenced by a manifest must exist on disk
         reachable_chunks: set[bytes] = set()
         reachable_files: set[bytes] = set()
         with IndexDB(self.index_path) as index:
-            for snap_row in index.list_snapshots():
+            snap_rows = list(index.list_snapshots())
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="verify_reachability",
+                label=f"walking {len(snap_rows)} manifests",
+                total=len(snap_rows),
+            ))
+            for s_i, snap_row in enumerate(snap_rows, 1):
                 manifest_path = self.repo_path / snap_row.manifest_path
                 if not manifest_path.is_file():
                     report.missing_manifests += 1
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="verify_reachability",
+                        label=f"missing manifest: {snap_row.id[:12]}",
+                        current=s_i, total=len(snap_rows),
+                    ))
                     continue
                 manifest = read_manifest(manifest_path)
                 for regions in manifest.dimensions.values():
@@ -705,14 +843,47 @@ class ChunkSnapshotRepo:
                     reachable_files.add(f.sha256)
                     if not self.chunks.has_file(f.sha256):
                         report.missing_referenced += 1
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="verify_reachability",
+                    label=snap_row.label or snap_row.id[:12],
+                    current=s_i, total=len(snap_rows),
+                ))
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="verify_reachability",
+                current=len(snap_rows), total=len(snap_rows),
+            ))
 
         # 3) Orphan-blob count: blobs present on disk but not referenced.
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="verify_orphans",
+            label="counting orphan blobs",
+        ))
+        i = 0
         for path, expected in _iter_pool_blobs(self.chunks.chunks_dir):
+            i += 1
             if expected not in reachable_chunks:
                 report.orphan_blobs += 1
+            if i % BATCH == 0:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="verify_orphans",
+                    label=f"{report.orphan_blobs} orphans so far",
+                    current=i,
+                ))
         for path, expected in _iter_pool_blobs(self.chunks.files_dir):
+            i += 1
             if expected not in reachable_files:
                 report.orphan_blobs += 1
+            if i % BATCH == 0:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="verify_orphans",
+                    label=f"{report.orphan_blobs} orphans so far",
+                    current=i,
+                ))
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="verify_orphans",
+            current=i, total=i,
+            detail={"orphans": report.orphan_blobs},
+        ))
 
         return report
 

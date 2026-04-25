@@ -32,6 +32,56 @@ from .ui import (
 )
 
 
+def _set_phase_total(progress, task_id, new_total) -> None:
+    """Force-set a Progress task's ``total`` (including to ``None``).
+
+    ``rich.progress.Progress.update(total=None)`` and ``reset(total=None)``
+    are both no-ops — they treat ``None`` as "keep current total". So once a
+    task gets a numeric total, the only way to clear it back to indeterminate
+    is to mutate the Task object directly. Without this, when one phase
+    finishes (e.g. region-hashing with total=11534) and the next starts
+    (e.g. roundtrip-restore with no known total), the bar shows a stale
+    ``0/11534`` for the entire next phase, looking frozen.
+    """
+    with progress._lock:
+        progress._tasks[task_id].total = new_total
+
+
+def _make_phase_cb(progress, task_id, prefix: str):
+    """Standard phase-tracking callback for a single rich Progress task.
+
+    All long-running ops (ingest, snapshot, verify, ...) share the same
+    pattern: one task that follows whichever phase is active. Translate
+    ``ProgressEvent`` into ``progress.update`` calls, with the stale-total
+    workaround (see :func:`_set_phase_total`) baked in.
+    """
+    def cb(e: ProgressEvent):
+        if e.kind == "phase_start":
+            _set_phase_total(progress, task_id, e.total if e.total else None)
+            progress.update(
+                task_id,
+                description=f"{prefix}: {e.phase} {e.label or ''}".strip(),
+                completed=0,
+            )
+        elif e.kind == "phase_progress":
+            if e.total:
+                _set_phase_total(progress, task_id, e.total)
+            progress.update(
+                task_id,
+                completed=e.current,
+                description=(
+                    f"{prefix}: {e.phase} {e.label}".strip()
+                    if e.label else None
+                ),
+            )
+        elif e.kind == "phase_done":
+            final = e.total or e.current or 0
+            if final:
+                _set_phase_total(progress, task_id, final)
+            progress.update(task_id, completed=e.current or e.total or 0)
+    return cb
+
+
 def run_wizard(console: Console | None = None) -> int:
     """Top-level entry point. Returns the process exit code."""
     console = console or make_console()
@@ -217,32 +267,7 @@ def run_ingest_flow(
         phase_task = progress.add_task("phase: idle", total=None)
 
         def make_cb():
-            """Translate ingest progress events into rich progress updates.
-
-            Tracks which phase is active; updates either total (on phase_start)
-            or current (on phase_progress) on the same phase_task.
-            """
-            def cb(e: ProgressEvent):
-                if e.kind == "phase_start":
-                    progress.update(
-                        phase_task,
-                        description=f"phase: {e.phase} {e.label or ''}".strip(),
-                        completed=0,
-                        total=e.total if e.total else None,
-                    )
-                elif e.kind == "phase_progress":
-                    progress.update(
-                        phase_task,
-                        completed=e.current,
-                        total=e.total if e.total else None,
-                    )
-                elif e.kind == "phase_done":
-                    progress.update(
-                        phase_task,
-                        completed=e.current or e.total or 0,
-                        total=e.total or e.current or None,
-                    )
-            return cb
+            return _make_phase_cb(progress, phase_task, prefix="phase")
 
         for archive in archives:
             progress.update(archive_task, description=f"archives: {archive.name}")
@@ -323,12 +348,7 @@ def run_snapshot_flow(console: Console, env: EnvironmentSummary):
     from ..store.repo import RoundTripVerificationError
     with progress:
         task = progress.add_task("snapshot", total=None)
-
-        def cb(e: ProgressEvent):
-            if e.kind == "phase_start":
-                progress.update(task, description=f"snapshot: {e.label}", total=e.total or None)
-            elif e.kind == "phase_progress":
-                progress.update(task, completed=e.current, total=e.total or None)
+        cb = _make_phase_cb(progress, task, prefix="snapshot")
 
         try:
             snap = repo.snapshot(world, label=label, allow_live=allow_live,
@@ -425,8 +445,11 @@ def run_verify_flow(console: Console, env: EnvironmentSummary):
     )
     repo = _pick_or_create_repo(console, env)
     repair = confirm(console, "Repair (delete) corrupt blobs?", default=False)
-    console.print("[dim]verifying…[/dim]")
-    report = repo.verify(repair=repair)
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("verify: idle", total=None)
+        cb = _make_phase_cb(progress, task, prefix="verify")
+        report = repo.verify(repair=repair, progress_cb=cb)
     console.print(
         f"chunks: ok={report.ok_chunks} corrupt={report.corrupt_chunks}\n"
         f"files:  ok={report.ok_files} corrupt={report.corrupt_files}\n"

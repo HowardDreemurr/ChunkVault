@@ -144,15 +144,10 @@ def _do_compare(
     exclude_patterns: tuple[str, ...],
     progress_cb: ProgressCallback,
 ) -> RoundTripReport:
-    _emit(progress_cb, ProgressEvent(
-        kind="phase_start", phase="roundtrip",
-        label="restoring snapshot to temp dir",
-    ))
-    repo.restore(snapshot, restore_path)
-    _emit(progress_cb, ProgressEvent(
-        kind="phase_done", phase="roundtrip",
-        label="restore complete",
-    ))
+    # Pass the callback INTO restore — it emits restore_regions /
+    # restore_files phases with per-item progress. Without this the
+    # roundtrip step is a silent multi-hour stretch on TB-scale worlds.
+    repo.restore(snapshot, restore_path, progress_cb=progress_cb)
 
     report = RoundTripReport()
     _compare_regions(original, restore_path, report, progress_cb)
