@@ -353,6 +353,19 @@ def cmd_verify_roundtrip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_browse(args: argparse.Namespace) -> int:
+    """Spin up a local Leaflet-based browser for visualizing the vault."""
+    from .viz.browser import serve
+    try:
+        serve(args.repo, host=args.host, port=args.port)
+    except KeyboardInterrupt:
+        return 0
+    except RuntimeError as e:
+        print(f"!! {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_thumbnail(args: argparse.Namespace) -> int:
     """Render thumbnail tiles + per-dim PNG sidecars for snapshots.
 
@@ -666,6 +679,17 @@ def build_parser() -> argparse.ArgumentParser:
     vrt.add_argument("original", type=Path,
                      help="path to the original world to compare against")
     vrt.set_defaults(func=cmd_verify_roundtrip)
+
+    br = sub.add_parser("browse",
+                        help="Start a local HTTP server with a Leaflet "
+                             "frontend for browsing snapshots visually. "
+                             "Non-production debug preview only.")
+    br.add_argument("repo", type=Path)
+    br.add_argument("--host", type=str, default="127.0.0.1",
+                    help="Bind host (default: localhost only).")
+    br.add_argument("--port", type=int, default=8765,
+                    help="Bind port (default: 8765).")
+    br.set_defaults(func=cmd_browse)
 
     th = sub.add_parser("thumbnail",
                         help="Render thumbnail tiles + per-dim PNG sidecars "
