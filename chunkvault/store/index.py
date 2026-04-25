@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS log_files (
     content_sha BLOB PRIMARY KEY,
     ref_count   INTEGER NOT NULL DEFAULT 0
 );
+
+-- Rendered tile presence + ref counting. Mode is "topdown" / "nether_low"
+-- / "nether_high"; same chunk hash can have multiple cached renders.
+-- ref_count tracks how many snapshot-rendered sidecars reference this
+-- (hash, mode) tile so gc can reclaim the on-disk tile when nothing
+-- needs it anymore.
+CREATE TABLE IF NOT EXISTS chunk_renders (
+    content_hash BLOB NOT NULL,
+    mode         TEXT NOT NULL,
+    ref_count    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (content_hash, mode)
+);
 """
 
 
@@ -466,6 +478,91 @@ class IndexDB:
         )
         row = cur.fetchone()
         return row[0] if row else 0
+
+    # ---- chunk render tile presence + refcount ------------------------------
+
+    def has_chunk_render(self, content_hash: bytes, mode: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM chunk_renders WHERE content_hash = ? AND mode = ?",
+            (content_hash, mode),
+        )
+        return cur.fetchone() is not None
+
+    def has_chunk_renders_bulk(
+        self, hashes: list[bytes], mode: str,
+    ) -> set[bytes]:
+        """Return the subset of ``hashes`` already rendered for ``mode``."""
+        if not hashes:
+            return set()
+        out: set[bytes] = set()
+        for i in range(0, len(hashes), 500):
+            batch = hashes[i:i + 500]
+            placeholders = ",".join("?" * len(batch))
+            cur = self._conn.execute(
+                f"SELECT content_hash FROM chunk_renders "
+                f"WHERE mode = ? AND content_hash IN ({placeholders})",
+                (mode, *batch),
+            )
+            out.update(row[0] for row in cur.fetchall())
+        return out
+
+    def add_chunk_renders(
+        self, items: list[tuple[bytes, str]],
+    ) -> None:
+        """Record presence of (hash, mode) tiles. ref_count unchanged.
+
+        Use ``adjust_chunk_render_refs`` to also bump references — splitting
+        the two lets the renderer mark a tile present without committing
+        to the snapshot that owns it being committed yet.
+        """
+        if not items:
+            return
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO chunk_renders (content_hash, mode) "
+                "VALUES (?, ?)",
+                items,
+            )
+
+    def adjust_chunk_render_refs(
+        self, items: list[tuple[bytes, str]], *, delta: int,
+    ) -> None:
+        """Bulk +/− on tile ref counts; inserts missing rows on +delta."""
+        if not items or delta == 0:
+            return
+        with self._conn:
+            for h, mode in items:
+                self._conn.execute(
+                    "INSERT INTO chunk_renders (content_hash, mode, ref_count) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(content_hash, mode) DO UPDATE "
+                    "SET ref_count = ref_count + ?",
+                    (h, mode, max(delta, 0), delta),
+                )
+
+    def chunk_render_ref_count(
+        self, content_hash: bytes, mode: str,
+    ) -> int:
+        cur = self._conn.execute(
+            "SELECT ref_count FROM chunk_renders "
+            "WHERE content_hash = ? AND mode = ?",
+            (content_hash, mode),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def gc_zero_ref_chunk_renders(self) -> list[tuple[bytes, str]]:
+        """Return + remove every (hash, mode) with ref_count <= 0."""
+        with self._conn:
+            cur = self._conn.execute(
+                "SELECT content_hash, mode FROM chunk_renders "
+                "WHERE ref_count <= 0"
+            )
+            items = [(row[0], row[1]) for row in cur.fetchall()]
+            self._conn.execute(
+                "DELETE FROM chunk_renders WHERE ref_count <= 0"
+            )
+        return items
 
     def gc_zero_ref_logs(self) -> list[bytes]:
         with self._conn:

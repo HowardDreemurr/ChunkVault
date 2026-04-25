@@ -135,3 +135,54 @@ def test_counts_reflect_state(tmp_path: Path):
         db.add_chunks([b"\x01" * 16, b"\x02" * 16])
         db.add_files([b"\x03" * 32])
         assert db.counts() == (2, 2, 1)
+
+
+# ---- chunk_renders (tile presence + refcount) -------------------------------
+
+def test_chunk_renders_presence_and_modes_independent(tmp_path: Path):
+    with IndexDB(tmp_path / "idx.sqlite") as db:
+        h = b"\xAB" * 16
+        assert not db.has_chunk_render(h, "topdown")
+        db.add_chunk_renders([(h, "topdown")])
+        assert db.has_chunk_render(h, "topdown")
+        # Same hash, different mode is a separate row
+        assert not db.has_chunk_render(h, "nether_low")
+        db.add_chunk_renders([(h, "nether_low")])
+        assert db.has_chunk_render(h, "nether_low")
+
+
+def test_chunk_renders_bulk_lookup(tmp_path: Path):
+    with IndexDB(tmp_path / "idx.sqlite") as db:
+        hashes = [bytes([i]) * 16 for i in range(5)]
+        db.add_chunk_renders([(h, "topdown") for h in hashes[:3]])
+        present = db.has_chunk_renders_bulk(hashes, "topdown")
+        assert present == set(hashes[:3])
+
+
+def test_chunk_renders_refcount(tmp_path: Path):
+    with IndexDB(tmp_path / "idx.sqlite") as db:
+        h = b"\xCD" * 16
+        items = [(h, "topdown")]
+        db.adjust_chunk_render_refs(items, delta=+1)
+        assert db.chunk_render_ref_count(h, "topdown") == 1
+        db.adjust_chunk_render_refs(items, delta=+1)
+        db.adjust_chunk_render_refs(items, delta=+1)
+        assert db.chunk_render_ref_count(h, "topdown") == 3
+        db.adjust_chunk_render_refs(items, delta=-2)
+        assert db.chunk_render_ref_count(h, "topdown") == 1
+
+
+def test_chunk_renders_gc_zero_ref(tmp_path: Path):
+    with IndexDB(tmp_path / "idx.sqlite") as db:
+        live = (b"\x01" * 16, "topdown")
+        dead1 = (b"\x02" * 16, "topdown")
+        dead2 = (b"\x02" * 16, "nether_low")  # same hash, different mode
+        db.adjust_chunk_render_refs([live], delta=+1)
+        db.adjust_chunk_render_refs([dead1, dead2], delta=+1)
+        db.adjust_chunk_render_refs([dead1, dead2], delta=-1)
+        # Live has ref=1, dead* have ref=0 → gc returns dead pair only
+        zero = set(db.gc_zero_ref_chunk_renders())
+        assert zero == {dead1, dead2}
+        # And the live entry survives
+        assert db.has_chunk_render(*live)
+        assert not db.has_chunk_render(*dead1)

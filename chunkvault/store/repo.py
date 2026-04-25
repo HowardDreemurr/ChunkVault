@@ -206,6 +206,8 @@ class ChunkSnapshotRepo:
         self.repo_path = Path(repo_path).resolve()
         self.chunks = ChunkStore(self.repo_path)
         self.logs = LogStore(self.repo_path)
+        from .tile_store import TileStore
+        self.tiles = TileStore(self.repo_path)
         self.manifests_dir = self.repo_path / "manifests"
         self.log_manifests_dir = self.repo_path / "log-snapshots"
         self.index_path = self.repo_path / "index.sqlite"
@@ -219,6 +221,7 @@ class ChunkSnapshotRepo:
         self.repo_path.mkdir(parents=True, exist_ok=True)
         self.chunks.init()
         self.logs.init()
+        self.tiles.init()
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
         self.log_manifests_dir.mkdir(parents=True, exist_ok=True)
         # Create index DB if absent
