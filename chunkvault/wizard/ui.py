@@ -1,4 +1,12 @@
-"""Rich-based UI primitives for the wizard.
+"""UI primitives for the wizard.
+
+Two libraries, divided by job:
+
+* **questionary** — interactive prompts (arrow-key menus, y/n confirms,
+  text input). Works cross-platform via prompt_toolkit. This is what gives
+  the wizard the "highlight + Enter" experience instead of typing letters.
+* **rich** — everything else: tables, panels, progress bars, colored text.
+  rich's Prompt is text-only; questionary fills the keyboard-nav gap.
 
 Isolated from flow logic so flows can be tested without instantiating
 console widgets. Each function takes a Console (passed in for testability)
@@ -9,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+import questionary
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -20,11 +29,22 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from ..store.inspect import ArchivePreview
 from .detect import EnvironmentSummary
+
+
+# A questionary style that pairs visually with rich's default theme.
+_QSTYLE = questionary.Style([
+    ("qmark",       "fg:#28c850 bold"),
+    ("question",    "bold"),
+    ("answer",      "fg:#28c850 bold"),
+    ("pointer",     "fg:#28c850 bold"),
+    ("highlighted", "fg:#28c850 bold"),
+    ("selected",    "fg:#28c850"),
+    ("instruction", "fg:#888888"),
+])
 
 
 # ---- formatting helpers ----------------------------------------------------
@@ -146,36 +166,51 @@ def render_archive_preview(console: Console, preview: ArchivePreview) -> None:
 
 # ---- prompts --------------------------------------------------------------
 
+_MENU_CHOICES = [
+    questionary.Choice("Ingest archives  (bulk-import backup zips)", value="i"),
+    questionary.Choice("Snapshot a live world",                       value="s"),
+    questionary.Choice("Diff two snapshots",                          value="d"),
+    questionary.Choice("List snapshots",                              value="l"),
+    questionary.Choice("Verify repo integrity",                       value="v"),
+    questionary.Choice("Garbage-collect (reclaim space)",             value="g"),
+    questionary.Choice("Quit",                                        value="q"),
+]
+
+
 def main_menu(console: Console) -> str:
-    """Ask the user what they want to do. Returns the chosen action key."""
-    console.print(Panel.fit(
-        "[bold]What would you like to do?[/bold]\n"
-        "  [cyan]i[/cyan]ngest archives  [dim]— bulk-import backup zips[/dim]\n"
-        "  [cyan]s[/cyan]napshot a live world\n"
-        "  [cyan]d[/cyan]iff two snapshots\n"
-        "  [cyan]l[/cyan]ist snapshots\n"
-        "  [cyan]v[/cyan]erify repo integrity\n"
-        "  [cyan]g[/cyan]c (reclaim space)\n"
-        "  [cyan]q[/cyan]uit",
-        title="Main menu", border_style="green",
-    ))
-    return Prompt.ask(
-        "Choice", choices=["i", "s", "d", "l", "v", "g", "q"],
-        default="i", console=console,
-    )
+    """Arrow-key main menu. Returns the chosen action key (i/s/d/l/v/g/q).
+
+    Falls back to a typed prompt if questionary can't take over the
+    terminal (e.g. running in a non-interactive shell or a captured
+    pytest stdin).
+    """
+    answer = questionary.select(
+        "What would you like to do?",
+        choices=_MENU_CHOICES,
+        default=_MENU_CHOICES[0],
+        style=_QSTYLE,
+        instruction="(use ↑↓ arrows to move, Enter to select)",
+    ).ask()
+    if answer is None:
+        # User pressed Ctrl-C / Esc — treat as quit
+        return "q"
+    return answer
 
 
 def prompt_path(
     console: Console, label: str, default: Path | None = None,
     *, must_exist: bool = False,
 ) -> Path:
-    """Ask for a filesystem path, validating it if requested."""
+    """Ask for a filesystem path with tab completion + history."""
     while True:
-        raw = Prompt.ask(
+        raw = questionary.path(
             label,
-            default=str(default) if default else None,
-            console=console,
-        )
+            default=str(default) if default else "",
+            only_directories=False,
+            style=_QSTYLE,
+        ).ask()
+        if raw is None:
+            raise KeyboardInterrupt("user cancelled")
         p = Path(raw).expanduser()
         if must_exist and not p.exists():
             console.print(f"[red]path does not exist:[/red] {p}")
@@ -184,20 +219,26 @@ def prompt_path(
 
 
 def confirm(console: Console, label: str, *, default: bool = True) -> bool:
-    return Confirm.ask(label, default=default, console=console)
+    """y/n prompt with Enter-for-default support."""
+    answer = questionary.confirm(
+        label, default=default, style=_QSTYLE,
+    ).ask()
+    return default if answer is None else answer
 
 
 def choose_one(
     console: Console, label: str, options: Sequence[str],
     *, default: str | None = None,
 ) -> str:
+    """Arrow-key choice from a list of strings."""
     if not options:
         raise ValueError("choose_one needs at least one option")
-    return Prompt.ask(
+    answer = questionary.select(
         label, choices=list(options),
         default=default if default in options else options[0],
-        console=console,
-    )
+        style=_QSTYLE,
+    ).ask()
+    return answer if answer is not None else (default or options[0])
 
 
 # ---- progress display ----------------------------------------------------
