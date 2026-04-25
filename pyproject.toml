@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chunkvault"
+version = "0.0.1"
+description = "Cross-version incremental backup library for Minecraft Java worlds with chunk-level diff"
+requires-python = ">=3.11"
+dependencies = [
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+chunkvault = "chunkvault.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chunkvault"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]

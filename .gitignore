@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+develop-eggs/
+.eggs/
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# OS
+desktop.ini
+
+# Build artifacts (PyInstaller etc.)
+*.spec
+*.exe
+
+# Local repos / scratch — these are demo/scratch dirs created during
+# development that should never end up tracked.
+cv-demo/
+backup-vault/
+backup-repo/
+.chunkvault-cache/
+
+# Logs
+*.log
+logs/
+
+# Claude Code internal state
+.claude/
