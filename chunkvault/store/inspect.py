@@ -34,6 +34,9 @@ class ArchiveServerPreview:
     has_level_dat: bool = False
     estimated_world_bytes: int = 0     # sum of sizes of files under world/
     estimated_log_bytes: int = 0       # sum of sizes of log + crash-report files
+    # Diagnostic: top-level dirs/files inside the server folder. Useful when
+    # region_files == 0 to see WHY — proxy server? non-standard layout?
+    top_level: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -86,7 +89,22 @@ def _summarize(
     path: Path, ts: datetime | None,
     entries: list[tuple[str, int]],          # (posix_path, size_bytes)
 ) -> ArchivePreview:
-    """Aggregate raw entries into per-server counts."""
+    """Aggregate raw entries into per-server counts.
+
+    Pattern-based: a region file is anything matching ``*/region/r.X.Z.mca``
+    at any depth under the server root. The dimension key is the path
+    leading up to (but not including) the .mca filename. This handles
+    every layout we've seen in the wild:
+
+    * vanilla:    ``world/region/r.0.0.mca`` → dim ``world/region``
+    * vanilla:    ``world/DIM-1/region/r.0.0.mca`` → dim ``world/DIM-1/region``
+    * Bukkit:     ``world_nether/region/r.0.0.mca`` → dim ``world_nether/region``
+    * Paper:      ``world_the_end/region/r.0.0.mca`` → dim ``world_the_end/region``
+    * Multiverse: ``survival/region/r.0.0.mca`` → dim ``survival/region``
+    * datapack:   ``world/dimensions/<ns>/<id>/region/r.0.0.mca``
+
+    No more hardcoded "world/" / "DIM*/" assumptions.
+    """
     # server_name -> dict of accumulators
     servers: dict[str, dict] = {}
     other_top_level: set[str] = set()
@@ -96,37 +114,52 @@ def _summarize(
         if not parts or parts[0] == "":
             continue
         top = parts[0]
-        # Anything that doesn't have a `world/` subdir at depth 1 is "other"
-        # for now; we'll classify after the loop.
         if top not in servers:
             servers[top] = {
                 "region_files": 0, "dimensions": set(),
                 "log_files": 0, "crash_report_files": 0,
                 "has_level_dat": False,
                 "estimated_world_bytes": 0, "estimated_log_bytes": 0,
+                "top_level": set(),   # diagnostic: what's under the server root
             }
         s = servers[top]
+        if len(parts) >= 2 and parts[1]:
+            s["top_level"].add(parts[1])
 
         rel = parts[1:]
         if not rel:
             continue
-        if rel[0] == "level.dat" and len(rel) == 1:
+
+        # 1) level.dat — anywhere from root to a few levels deep
+        if rel[-1] == "level.dat" and len(rel) <= 3:
             s["has_level_dat"] = True
             s["estimated_world_bytes"] += size
             continue
-        if rel[0] == "world" or rel[0] == "region" or rel[0].startswith("DIM"):
-            # World contents (might be nested under world/ or directly at top)
-            world_rel = rel[1:] if rel[0] == "world" else rel
-            _classify_world_entry(world_rel, size, s)
+
+        # 2) Region file: any path ending in /region/r.X.Z.mca
+        if (len(rel) >= 2 and rel[-2] == "region"
+                and _REGION_NAME_RE.match(rel[-1])):
+            s["region_files"] += 1
+            dim_key = "/".join(rel[:-1])   # drop the .mca filename
+            s["dimensions"].add(dim_key)
+            s["estimated_world_bytes"] += size
             continue
-        if rel[0] in LOG_SUBPATHS:
-            if rel[0] == "logs":
-                s["log_files"] += 1
-            else:
-                s["crash_report_files"] += 1
+
+        # 3) External chunk file (.mcc) — count toward world bytes only
+        if rel[-1].startswith("c.") and rel[-1].endswith(".mcc"):
+            s["estimated_world_bytes"] += size
+            continue
+
+        # 4) Logs / crash reports
+        if rel[0] == "logs":
+            s["log_files"] += 1
             s["estimated_log_bytes"] += size
             continue
-        # Anything else (server.properties, mods/, etc.) → ignored for ingest
+        if rel[0] == "crash-reports":
+            s["crash_report_files"] += 1
+            s["estimated_log_bytes"] += size
+            continue
+        # Anything else (server.properties, mods/, plugins/, …) → ignored
 
     # Drop "servers" that don't actually look like one
     real_servers: list[ArchiveServerPreview] = []
@@ -145,6 +178,7 @@ def _summarize(
             has_level_dat=s["has_level_dat"],
             estimated_world_bytes=s["estimated_world_bytes"],
             estimated_log_bytes=s["estimated_log_bytes"],
+            top_level=sorted(s["top_level"]),
         ))
 
     return ArchivePreview(

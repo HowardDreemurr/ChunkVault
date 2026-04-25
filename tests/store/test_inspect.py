@@ -52,9 +52,11 @@ def test_preview_zip_finds_servers_and_counts(tmp_path: Path):
 
     by_name = {s.name: s for s in p.servers}
     ex = by_name["EX-Server"]
-    assert ex.region_files == 2          # one in region/, one in DIM-1/region/
-    assert "region" in ex.dimensions
-    assert "DIM-1/region" in ex.dimensions
+    assert ex.region_files == 2          # one in world/region/, one in world/DIM-1/region/
+    # dim_keys are now the FULL relative path under the server root, since
+    # the world dir name isn't hardcoded to "world" anymore.
+    assert "world/region" in ex.dimensions
+    assert "world/DIM-1/region" in ex.dimensions
     assert ex.log_files == 3
     assert ex.crash_report_files == 1
     assert ex.has_level_dat is True
@@ -63,6 +65,7 @@ def test_preview_zip_finds_servers_and_counts(tmp_path: Path):
 
     cr = by_name["CR-Server"]
     assert cr.region_files == 1
+    assert "world/region" in cr.dimensions
     assert cr.log_files == 1
 
 

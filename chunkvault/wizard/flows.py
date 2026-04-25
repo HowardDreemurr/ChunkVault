@@ -28,6 +28,7 @@ from .ui import (
     prompt_path,
     render_environment,
     render_op_intro,
+    select_archives,
 )
 
 
@@ -154,16 +155,18 @@ def run_ingest_flow(
     from ..store import preview_archive
     from .ui import render_archive_preview
     previews = []
-    show_detail = min(10, len(archives))
-    for i, archive in enumerate(archives):
+    # Compact one-line view if many archives; full table per archive when ≤ 5.
+    # (Five fits comfortably on one screen; beyond that, the table scrolling
+    # makes it impossible to compare archives side-by-side.)
+    use_compact = len(archives) > 5
+    for archive in archives:
         prev = preview_archive(archive)
         previews.append(prev)
-        if i < show_detail:
-            render_archive_preview(console, prev)
-    if len(archives) > show_detail:
+        render_archive_preview(console, prev, compact=use_compact)
+    if use_compact:
         console.print(
-            f"[dim]… (+{len(archives) - show_detail} more archives, "
-            f"detail omitted)[/dim]"
+            "[dim](compact view — pick [c]ompact-off below to see full per-archive "
+            "tables, or accept defaults to ingest each ✓ archive.)[/dim]"
         )
 
     # Aggregate totals across all previews
@@ -186,9 +189,19 @@ def run_ingest_flow(
     if failed:
         console.print(f"  [red]{len(failed)} unreadable archive(s) — will be skipped[/red]")
 
-    if not confirm(console, "Proceed?", default=True):
-        console.print("[yellow]cancelled.[/yellow]")
+    # Per-archive selection: user can uncheck individual archives instead of
+    # the all-or-nothing Proceed? prompt. Pre-checks "clean" archives (every
+    # detected server has regions); leaves problematic ones unchecked so they
+    # require an explicit decision.
+    selected = select_archives(archives, previews)
+    if not selected:
+        console.print("[yellow]nothing selected — cancelled.[/yellow]")
         return []
+    selected_set = {a for a in selected}
+    archives = [a for a in archives if a in selected_set]
+    console.print(
+        f"[dim]ingesting {len(archives)} archive(s)…[/dim]"
+    )
 
     results: list[IngestResult] = []
     verify_failures: list[tuple[str, str]] = []     # (archive_name, reason)
@@ -220,10 +233,17 @@ def run_ingest_flow(
     # Summary
     snaps = sum(len(r.snapshots) for r in results)
     log_snaps = sum(1 for r in results if r.log_snapshot is not None)
+    already = sum(len(r.already_ingested) for r in results)
     console.print(
-        f"\n[green]done.[/green] {snaps} world snapshots, {log_snaps} log snapshots, "
-        f"{len(results)}/{len(archives)} archives ingested cleanly."
+        f"\n[green]done.[/green] {snaps} new world snapshots, "
+        f"{log_snaps} log snapshots, "
+        f"{len(results)}/{len(archives)} archives processed cleanly."
     )
+    if already:
+        console.print(
+            f"[dim]{already} server(s) already in the vault — skipped "
+            f"(re-ingest is idempotent).[/dim]"
+        )
     if verify_failures:
         console.print(
             f"[red]{len(verify_failures)} archive(s) failed round-trip verify "

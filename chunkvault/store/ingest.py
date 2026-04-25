@@ -54,6 +54,10 @@ class IngestResult:
     log_snapshot: LogSnapshot | None = None
     server_names: list[str] = field(default_factory=list)
     skipped_servers: list[tuple[str, str]] = field(default_factory=list)
+    # Servers we found in the archive that already had a snapshot at this
+    # timestamp — skipped silently to make re-ingest idempotent. Each entry
+    # is ``(server_name, existing_snapshot_short_id)``.
+    already_ingested: list[tuple[str, str]] = field(default_factory=list)
 
 
 class _extract_or_passthrough:
@@ -105,24 +109,134 @@ def parse_timestamp_from_name(name: str) -> datetime | None:
         return None
 
 
-def discover_servers(extracted_root: Path) -> list[tuple[str, Path]]:
-    """Find ``(server_name, server_root)`` for each top-level dir that has world/.
+@dataclass(frozen=True)
+class DiscoveredServer:
+    """One server detected in an archive.
 
-    Falls back to a single anonymous server if the archive's contents look
-    like a bare world (no nested server folders).
+    ``server_root`` is the directory containing logs/, crash-reports/, mods/,
+    server.properties — the place a Minecraft server runs from. It's the
+    parent dir whose name we use as the server label.
+
+    ``world_root`` is the directory we pass to ``repo.snapshot()``. It's the
+    tightest path that contains all region/ dirs for this server. For most
+    layouts this is one level below server_root (``server/world/``); for
+    Bukkit's parallel-worlds layout it equals server_root.
     """
+    server_name: str
+    server_root: Path
+    world_root: Path
+
+
+def discover_servers(extracted_root: Path) -> list[tuple[str, Path]]:
+    """Backwards-compatible API: ``(server_name, world_root)`` per server.
+
+    Use :func:`discover_servers_full` for ``server_root`` (where logs live).
+    """
+    return [(d.server_name, d.world_root)
+            for d in discover_servers_full(extracted_root)]
+
+
+def discover_servers_full(extracted_root: Path) -> list[DiscoveredServer]:
+    """Find every server in ``extracted_root`` with both server_root +
+    world_root.
+
+    A "server" is any directory under which we find at least one
+    ``region/r.X.Z.mca`` file (depth-bounded). Layout examples:
+
+    * standard: ``archive/EX-Server/world/region/r.X.Z.mca``
+                → server_root=``EX-Server``, world_root=``EX-Server/world``
+    * datapack: ``archive/EX-Server/world/dimensions/.../region/...``
+                → world_root still ``EX-Server/world``
+    * Bukkit:   ``archive/EX-Server/{world,world_nether,world_the_end}/region/...``
+                → world_root=server_root=``EX-Server`` (parallel worlds)
+    * custom:   ``archive/EX-Server/survival/region/...``
+                → world_root=``EX-Server/survival``
+    * bare:     ``archive/world/region/...`` (no server wrapper)
+                → server_root=world_root=``archive``, name=archive name
+    * direct:   ``archive/region/...``
+                → server_root=world_root=``archive``, name=archive name
+
+    The split lets us snapshot only world data (world_root) while still
+    finding logs/ + crash-reports/ at the server level (server_root).
+    """
+    from ..world.layout import _find_region_dirs
+
     if not extracted_root.is_dir():
         return []
-    servers: list[tuple[str, Path]] = []
-    for entry in sorted(extracted_root.iterdir()):
-        if entry.is_dir() and (entry / "world").is_dir():
-            servers.append((entry.name, entry))
-    if servers:
-        return servers
-    # Fallback: maybe the archive root IS a server (has world/ at root)
-    if (extracted_root / "world").is_dir():
-        return [(extracted_root.name or "world", extracted_root)]
+    out: list[DiscoveredServer] = []
+    try:
+        children = sorted(extracted_root.iterdir())
+    except OSError:
+        return []
+    for entry in children:
+        if not entry.is_dir():
+            continue
+        region_dirs = list(_find_region_dirs(entry, max_depth=6))
+        if not region_dirs:
+            continue
+        world_root = _common_world_root(entry, region_dirs)
+        out.append(DiscoveredServer(
+            server_name=entry.name,
+            server_root=entry,
+            world_root=world_root,
+        ))
+    if out:
+        return out
+    # Fallback: archive root IS the server (no nested server folders)
+    region_dirs = list(_find_region_dirs(extracted_root, max_depth=6))
+    if region_dirs:
+        world_root = _common_world_root(extracted_root, region_dirs)
+        name = extracted_root.name or "world"
+        return [DiscoveredServer(
+            server_name=name,
+            server_root=extracted_root,
+            world_root=world_root,
+        )]
     return []
+
+
+def _common_world_root(server_root: Path, region_dirs: list[Path]) -> Path:
+    """Tightest path under (or equal to) server_root that contains every
+    region dir.
+
+    For a single region tree (e.g. ``server/world/region/`` and
+    ``server/world/DIM-1/region/``) this returns ``server/world``. For
+    Bukkit's parallel-worlds layout (``server/world/region``,
+    ``server/world_nether/region``) the only shared ancestor is
+    ``server`` itself, so that's what we return.
+    """
+    if not region_dirs:
+        return server_root
+    # Use os.path.commonpath on the *parents* of region dirs (the dim-root
+    # under which `region/` sits), then walk back up so we sit one level
+    # above region/ — that's the world root.
+    import os
+    # Each region dir is `<world>/.../region`; we want the world part.
+    # Take the parent of region/ as the candidate; in datapack cases this is
+    # `<world>/dimensions/<ns>/<id>`. Find the common prefix across all of
+    # them, then ensure the result is at or above server_root.
+    candidates = [str(rd.parent) for rd in region_dirs]
+    common = os.path.commonpath(candidates) if len(candidates) > 1 else candidates[0]
+    common_path = Path(common)
+    # Walk up to ensure result is at most server_root (commonpath could
+    # already equal a region dir's parent if there's only one, which is fine).
+    try:
+        common_path.relative_to(server_root)
+    except ValueError:
+        return server_root
+    # If the common path's last component is a "region pattern" component
+    # (e.g. `dimensions`), step up to the world dir. Easier rule: the world
+    # root is the highest path ≤ common_path that has level.dat, OR
+    # common_path itself if no level.dat exists between server_root and it.
+    walker = common_path
+    while walker != server_root and walker.parent != walker:
+        if (walker / "level.dat").is_file():
+            return walker
+        walker = walker.parent
+    if (server_root / "level.dat").is_file():
+        return server_root
+    # No level.dat found anywhere — return common_path as best guess
+    return common_path
 
 
 def collect_log_files(server_root: Path) -> list[tuple[str, bytes]]:
@@ -171,60 +285,90 @@ def ingest_archive(
     ))
 
     with _extract_or_passthrough(archive_path) as extracted:
-        servers = discover_servers(extracted)
+        servers = discover_servers_full(extracted)
         if not servers:
             raise ImportError(
                 f"{archive_path.name}: no server folders detected "
-                f"(looked for top-level dirs containing 'world')"
+                f"(looked for any directory containing region/r.X.Z.mca files)"
             )
 
         all_log_files: dict[str, list[tuple[str, bytes]]] = {}
 
-        for i, (server_name, server_root) in enumerate(servers, 1):
-            world_path = server_root / "world"
-            label = f"{server_name}-{ts_label}"
+        for i, server in enumerate(servers, 1):
+            label = f"{server.server_name}-{ts_label}"
+
+            # Idempotency: if a snapshot with this exact label already exists,
+            # the archive has been ingested before. Skip silently — content-
+            # addressed storage means a redundant snapshot wouldn't duplicate
+            # any chunks, but it WOULD add a new manifest + index row, so
+            # skipping is both faster and avoids visual clutter for the user.
+            existing = repo.get(label)
+            if existing is not None:
+                result.already_ingested.append(
+                    (server.server_name, existing.short_id),
+                )
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_done", phase="server_world",
+                    label=f"{server.server_name} (already ingested)",
+                    current=i, total=len(servers),
+                ))
+                continue
+
             _emit(progress_cb, ProgressEvent(
                 kind="phase_start", phase="server_world",
-                label=server_name, current=i, total=len(servers),
+                label=server.server_name, current=i, total=len(servers),
             ))
             try:
+                # Pass world_root (the dir containing level.dat + region/),
+                # not server_root — keeps mods/, plugins/, server.properties
+                # out of the snapshot. world_root is auto-detected so it works
+                # for "world", "world_nether", custom names, etc.
                 snap = repo.snapshot(
-                    world_path,
+                    server.world_root,
                     label=label,
                     timestamp=ts,
                     allow_live=True,         # archives aren't live worlds
                     verify_roundtrip=verify_roundtrip,
-                    world_name=server_name,
+                    world_name=server.server_name,
                     progress_cb=progress_cb,
                 )
                 result.snapshots.append(snap)
-                result.server_names.append(server_name)
+                result.server_names.append(server.server_name)
             except Exception as e:
-                result.skipped_servers.append((server_name, str(e)))
+                result.skipped_servers.append((server.server_name, str(e)))
                 _emit(progress_cb, ProgressEvent(
                     kind="error", phase="server_world",
-                    label=server_name, detail={"error": str(e)},
+                    label=server.server_name, detail={"error": str(e)},
                 ))
                 continue
 
             if not skip_logs:
-                files = collect_log_files(server_root)
+                # Logs sit at the SERVER root (sibling of world dirs), not
+                # inside world_root.
+                files = collect_log_files(server.server_root)
                 if files:
-                    all_log_files[server_name] = files
+                    all_log_files[server.server_name] = files
 
         if not skip_logs and all_log_files:
-            _emit(progress_cb, ProgressEvent(
-                kind="phase_start", phase="logs",
-                label="capturing logs",
-                total=sum(len(v) for v in all_log_files.values()),
-            ))
-            log_snap = repo.add_log_snapshot(
-                all_log_files,
-                label=ts_label,
-                source_path=archive_path,
-                timestamp=ts,
-            )
-            result.log_snapshot = log_snap
+            # Idempotency: log snapshots are labelled by archive timestamp,
+            # so re-ingest of the same archive would create a duplicate row
+            # (blobs would dedupe, but rows wouldn't). Skip if present.
+            existing_log = repo.get_log_snapshot(ts_label)
+            if existing_log is not None:
+                result.log_snapshot = existing_log
+            else:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_start", phase="logs",
+                    label="capturing logs",
+                    total=sum(len(v) for v in all_log_files.values()),
+                ))
+                log_snap = repo.add_log_snapshot(
+                    all_log_files,
+                    label=ts_label,
+                    source_path=archive_path,
+                    timestamp=ts,
+                )
+                result.log_snapshot = log_snap
 
     _emit(progress_cb, ProgressEvent(
         kind="finish", phase="ingest_archive",
@@ -232,6 +376,7 @@ def ingest_archive(
         detail={
             "snapshots": len(result.snapshots),
             "skipped": len(result.skipped_servers),
+            "already_ingested": len(result.already_ingested),
             "log_snapshot": result.log_snapshot.id if result.log_snapshot else None,
         },
     ))

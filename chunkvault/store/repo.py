@@ -1113,17 +1113,40 @@ class ChunkSnapshotRepo:
 # ---- helpers ----------------------------------------------------------------
 
 def _read_level_dat_version(world: Path) -> tuple[str | None, int | None]:
-    """Best-effort read of mc_version + data_version from world/level.dat."""
-    level = world / "level.dat"
-    if not level.is_file():
-        return None, None
-    try:
-        raw = level.read_bytes()
-        # level.dat is gzip-NBT
-        nbt = decompress_chunk_payload(1, raw)
-    except Exception:
-        return None, None
-    return find_version_info(nbt)
+    """Best-effort read of mc_version + data_version from a level.dat.
+
+    Tries ``world/level.dat`` first (when ``world`` IS the world dir), then
+    falls back to a bounded search up to depth 2 (when ``world`` is a server
+    root containing a world subdir like ``EX-Server/world/level.dat`` or
+    ``EX-Server/survival/level.dat``). Returns (None, None) if no readable
+    level.dat is found.
+    """
+    candidates = [world / "level.dat"]
+    if not candidates[0].is_file():
+        # Search depth ≤ 2 — covers server_root/world/level.dat and
+        # server_root/<custom>/level.dat. Bounded so we don't scan a giant
+        # filesystem if the user points us somewhere weird.
+        try:
+            for child in world.iterdir():
+                if child.is_dir():
+                    cand = child / "level.dat"
+                    if cand.is_file():
+                        candidates.append(cand)
+        except OSError:
+            pass
+
+    for level in candidates:
+        if not level.is_file():
+            continue
+        try:
+            raw = level.read_bytes()
+            nbt = decompress_chunk_payload(1, raw)
+        except Exception:
+            continue
+        version = find_version_info(nbt)
+        if version != (None, None):
+            return version
+    return None, None
 
 
 def _walk_world_files(world: Path) -> Iterator[Path]:
@@ -1134,24 +1157,28 @@ def _walk_world_files(world: Path) -> Iterator[Path]:
 
 
 def _looks_like_mc_world(world: Path) -> bool:
-    """Cheap sanity check: real MC worlds have level.dat OR a region/ subdir.
+    """Cheap sanity check: refuse to snapshot directories that obviously
+    aren't MC worlds (the archive folder, the vault itself, /home, etc).
 
-    Used by snapshot() to refuse running on obviously-wrong inputs (the
-    archive folder, the vault itself, /home, etc.) before ingesting 84 GB
-    of irrelevant files.
+    Accepts ANY directory containing either:
+
+    * ``level.dat`` at the root, OR
+    * any sub-directory matching the pattern ``*/region/r.X.Z.mca`` (at any
+      reasonable depth) — covers vanilla, Bukkit/Paper world_nether, custom
+      world names from server.properties, datapack dimensions, and even
+      "world is at the archive root with no wrapper" cases.
+
+    Used to be: hardcoded list of known dim-dir names. That broke on real
+    user data with custom world names.
     """
+    if not world.is_dir():
+        return False
     if (world / "level.dat").is_file():
         return True
-    # Vanilla overworld
-    if (world / "region").is_dir():
+    # Use the same finder enumerate_region_dirs uses — first hit is enough
+    from ..world.layout import _find_region_dirs
+    for _ in _find_region_dirs(world, max_depth=6):
         return True
-    # Any DIM-* folder counts (some servers don't have an overworld)
-    for entry in world.iterdir() if world.is_dir() else ():
-        if entry.is_dir() and entry.name.startswith("DIM") \
-                and (entry / "region").is_dir():
-            return True
-        if entry.name == "dimensions" and entry.is_dir():
-            return True
     return False
 
 

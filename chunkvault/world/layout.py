@@ -1,17 +1,21 @@
 """Enumerate dimension region-directories within a Minecraft world folder.
 
-Vanilla layout:
-    <world>/region/             overworld
-    <world>/DIM-1/region/       nether
-    <world>/DIM1/region/        the end
+Real-world MC server layouts vary wildly:
 
-Datapack / modded layout (added 1.16+):
-    <world>/dimensions/<namespace>/<id>/region/
+    <world>/region/                              vanilla overworld
+    <world>/DIM-1/region/                        vanilla nether
+    <world>/DIM1/region/                         vanilla end
+    <world>/dimensions/<ns>/<id>/region/         datapack
+    <server>/world/region/                       Bukkit overworld
+    <server>/world_nether/region/                Bukkit nether
+    <server>/world_the_end/region/               Bukkit end
+    <server>/<custom>/region/                    Multiverse / renamed worlds
+    <server>/world/region/                       (any name from server.properties level-name)
 
-Each `RegionDir.dimension_key` is the directory path relative to the world
-root, using forward slashes even on Windows — so the same key identifies
-the same dimension across OSes, and it's trivially round-trippable to and
-from config or diff output.
+Rather than hardcode the known layouts, we just look for ANY directory named
+``region`` (anywhere within world_root, depth-bounded) that contains
+``r.X.Z.mca`` files. The dimension_key is the relative posix path from
+world_root to the region dir — uniquely identifies it forever.
 """
 from __future__ import annotations
 
@@ -21,7 +25,9 @@ from typing import Iterator
 
 from ..mca.region import parse_region_filename
 
-VANILLA_DIMENSIONS = ("region", "DIM-1/region", "DIM1/region")
+# Maximum depth (from world_root) at which we'll look for region/ directories.
+# Vanilla goes 2-4 levels (world/dimensions/ns/id/region/). 6 is generous.
+_MAX_REGION_DEPTH = 6
 
 
 @dataclass(frozen=True)
@@ -31,33 +37,54 @@ class RegionDir:
 
 
 def enumerate_region_dirs(world_root: Path | str) -> list[RegionDir]:
-    """Find every region directory inside a world folder.
+    """Find every region directory under ``world_root``, regardless of layout.
 
-    Missing directories are silently skipped. Order is deterministic:
-    vanilla dimensions in canonical order, then datapack dimensions sorted
-    by namespace + id.
+    A "region directory" is any directory named ``region`` (depth ≤ 6 from
+    world_root) that contains at least one ``r.X.Z.mca`` file. Returns them
+    sorted by dimension_key for deterministic iteration.
     """
     root = Path(world_root)
     results: list[RegionDir] = []
-
-    for rel in VANILLA_DIMENSIONS:
-        # Each vanilla rel is already "<forward>/<slash>" form.
-        p = root / rel
-        if p.is_dir():
-            results.append(RegionDir(dimension_key=rel, path=p))
-
-    dims = root / "dimensions"
-    if dims.is_dir():
-        for ns in sorted(dims.iterdir(), key=lambda p: p.name):
-            if not ns.is_dir():
-                continue
-            for dim_id in sorted(ns.iterdir(), key=lambda p: p.name):
-                reg = dim_id / "region"
-                if reg.is_dir():
-                    key = f"dimensions/{ns.name}/{dim_id.name}/region"
-                    results.append(RegionDir(dimension_key=key, path=reg))
-
+    if not root.is_dir():
+        return results
+    for region_dir in _find_region_dirs(root, _MAX_REGION_DEPTH):
+        rel = region_dir.relative_to(root).as_posix()
+        results.append(RegionDir(dimension_key=rel, path=region_dir))
+    results.sort(key=lambda r: r.dimension_key)
     return results
+
+
+def _find_region_dirs(root: Path, max_depth: int) -> Iterator[Path]:
+    """Yield directories named 'region' that contain at least one .mca file."""
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            children = list(current.iterdir())
+        except (PermissionError, OSError):
+            continue
+        for child in children:
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            if child.name == "region":
+                # Verify it has at least one region file
+                try:
+                    has_mca = any(
+                        f.is_file()
+                        and parse_region_filename(f) is not None
+                        for f in child.iterdir()
+                    )
+                except (PermissionError, OSError):
+                    has_mca = False
+                if has_mca:
+                    yield child
+                # Don't descend further — a region/ dir doesn't have nested regions
+                continue
+            if depth + 1 < max_depth:
+                stack.append((child, depth + 1))
 
 
 def iter_region_files(region_dir: Path) -> Iterator[tuple[int, int, Path]]:

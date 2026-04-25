@@ -101,13 +101,17 @@ def test_ingest_flow_runs_through_archives(tmp_path: Path, monkeypatch):
     #   4. (add another?)      → False
     #   5. (capture logs?)     → True
     #   6. (verify each?)      → False (skip — tests don't need the slow path)
-    #   7. (proceed?)          → True
+    # (Per-archive selection replaces the old "proceed?" prompt — we mock
+    #  select_archives to accept everything below.)
     fake_prompt = FakePrompt([str(repo_path)])
-    fake_confirm = FakeConfirm([True, True, False, True, False, True])
+    fake_confirm = FakeConfirm([True, True, False, True, False])
     monkeypatch.setattr("chunkvault.wizard.flows.prompt_path",
                         lambda c, lbl, **kw: Path(fake_prompt(lbl, default=kw.get("default"))))
     monkeypatch.setattr("chunkvault.wizard.flows.confirm",
                         lambda c, lbl, default=True: fake_confirm(lbl, default=default))
+    # questionary.checkbox needs a real Windows console — bypass it in tests.
+    monkeypatch.setattr("chunkvault.wizard.flows.select_archives",
+                        lambda archives, previews: list(archives))
 
     console = _make_console()
     results = flows.run_ingest_flow(console, env)
@@ -132,13 +136,15 @@ def test_ingest_flow_aborts_when_user_declines(tmp_path: Path, monkeypatch):
     repo_path = tmp_path / "repo"
 
     fake_prompt = FakePrompt([str(repo_path)])
-    # init=yes, use source=yes, add another=no, capture logs=yes,
-    # verify each=no, proceed=NO
-    fake_confirm = FakeConfirm([True, True, False, True, False, False])
+    # init=yes, use source=yes, add another=no, capture logs=yes, verify=no
+    fake_confirm = FakeConfirm([True, True, False, True, False])
     monkeypatch.setattr("chunkvault.wizard.flows.prompt_path",
                         lambda c, lbl, **kw: Path(fake_prompt(lbl, default=kw.get("default"))))
     monkeypatch.setattr("chunkvault.wizard.flows.confirm",
                         lambda c, lbl, default=True: fake_confirm(lbl, default=default))
+    # User aborts the per-archive selection (returns empty list)
+    monkeypatch.setattr("chunkvault.wizard.flows.select_archives",
+                        lambda archives, previews: [])
 
     console = _make_console()
     results = flows.run_ingest_flow(console, env)

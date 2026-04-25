@@ -107,12 +107,23 @@ def render_environment(console: Console, env: EnvironmentSummary) -> None:
 
 # ---- archive preview -------------------------------------------------------
 
-def render_archive_preview(console: Console, preview: ArchivePreview) -> None:
+def render_archive_preview(
+    console: Console, preview: ArchivePreview, *, compact: bool = False,
+) -> None:
     """Show what's INSIDE an archive — servers, regions, logs.
 
     The wizard renders this for each archive before the final confirmation
     so the user can verify content matches expectations.
+
+    ``compact=True`` collapses to one line per archive — used when many
+    archives are previewed at once. Diagnostic noise (top-level entries,
+    ignored siblings) is shown ONLY when something looks wrong (no servers
+    or zero region files), per user request to keep clean cases quiet.
     """
+    if compact:
+        _render_archive_preview_compact(console, preview)
+        return
+
     header = f"[bold cyan]{preview.path.name}[/bold cyan]"
     if preview.timestamp:
         header += f"  [dim](timestamp: {preview.timestamp.isoformat()})[/dim]"
@@ -124,6 +135,8 @@ def render_archive_preview(console: Console, preview: ArchivePreview) -> None:
 
     if not preview.servers:
         console.print("  [yellow]no server folders detected[/yellow]")
+        # Diagnostic — only when we DIDN'T find anything: show what was
+        # there so the user can tell if they pointed at the wrong path.
         if preview.other_top_level:
             console.print(
                 f"  [dim]top-level entries: "
@@ -141,13 +154,16 @@ def render_archive_preview(console: Console, preview: ArchivePreview) -> None:
     table.add_column("level.dat")
     table.add_column("world size", justify="right")
 
+    any_zero_region = False
     for s in preview.servers:
         dims = ", ".join(s.dimensions) if s.dimensions else "-"
         if len(dims) > 40:
             dims = dims[:37] + "…"
+        if s.region_files == 0:
+            any_zero_region = True
         table.add_row(
             s.name,
-            str(s.region_files),
+            str(s.region_files) if s.region_files else "[red]0[/red]",
             dims,
             str(s.log_files),
             str(s.crash_report_files),
@@ -155,13 +171,83 @@ def render_archive_preview(console: Console, preview: ArchivePreview) -> None:
             fmt_bytes(s.estimated_world_bytes),
         )
     console.print(table)
-    if preview.other_top_level:
-        console.print(
-            f"  [dim]ignored top-level entries: "
-            f"{', '.join(preview.other_top_level[:6])}"
-            f"{'…' if len(preview.other_top_level) > 6 else ''}[/dim]"
-        )
+
+    # Diagnostic — only when something looks wrong. A zero-region server is
+    # almost always a layout-detection failure, so the user wants to see what
+    # was inside that server folder. A clean archive doesn't need any noise.
+    if any_zero_region:
+        for s in preview.servers:
+            if s.region_files == 0 and s.top_level:
+                console.print(
+                    f"  [dim]{s.name} contains: "
+                    f"{', '.join(s.top_level[:8])}"
+                    f"{'…' if len(s.top_level) > 8 else ''}[/dim]"
+                )
     console.print()
+
+
+def _render_archive_preview_compact(
+    console: Console, preview: ArchivePreview,
+) -> None:
+    """One-line summary per archive — for bulk previews."""
+    if preview.error:
+        console.print(
+            f"  [red]✗[/red] {preview.path.name}: {preview.error}"
+        )
+        return
+    if not preview.servers:
+        console.print(
+            f"  [yellow]?[/yellow] {preview.path.name}: "
+            f"[dim]no servers detected[/dim]"
+        )
+        return
+    bits: list[str] = []
+    for s in preview.servers:
+        marker = "" if s.region_files else "[red]![/red]"
+        bits.append(
+            f"[cyan]{s.name}[/cyan]"
+            f"({s.region_files}r/{s.log_files}l){marker}"
+        )
+    console.print(f"  [green]✓[/green] {preview.path.name}: {' '.join(bits)}")
+
+
+def select_archives(
+    archives: list, previews: list,
+) -> list:
+    """Multi-select checkbox over archives. Returns the filtered list.
+
+    Pre-checks all archives where the preview looks clean (no error AND at
+    least one server with regions). Lets the user uncheck individual ones.
+    Returns the user's selection (empty list if cancelled).
+    """
+    import questionary
+    choices = []
+    for archive, preview in zip(archives, previews):
+        # Build a single-line label that fits in a terminal
+        if preview.error:
+            tag = f"[error: {preview.error[:30]}]"
+            checked = False
+        elif not preview.servers:
+            tag = "[no servers]"
+            checked = False
+        else:
+            servers_summary = ", ".join(
+                f"{s.name}({s.region_files}r)" for s in preview.servers
+            )
+            if len(servers_summary) > 60:
+                servers_summary = servers_summary[:57] + "…"
+            tag = servers_summary
+            # Pre-check only "clean" archives (every server has regions)
+            checked = all(s.region_files > 0 for s in preview.servers)
+        label = f"{archive.name}  │ {tag}"
+        choices.append(questionary.Choice(label, value=archive, checked=checked))
+    answer = questionary.checkbox(
+        "Select archives to ingest (Space toggles, Enter confirms):",
+        choices=choices,
+        style=_QSTYLE,
+        instruction="(↑↓ move, Space toggle, a all, i invert, Enter accept)",
+    ).ask()
+    return list(answer) if answer is not None else []
 
 
 # ---- prompts --------------------------------------------------------------
