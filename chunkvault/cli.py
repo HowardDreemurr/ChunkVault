@@ -353,6 +353,96 @@ def cmd_verify_roundtrip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_retime(args: argparse.Namespace) -> int:
+    """Reassign one or many snapshots' timestamps."""
+    from datetime import datetime, timezone
+    from .store import ChunkSnapshotRepo
+    from .store.repo import ChunkRepoError
+    from .store.manifest import read_manifest
+
+    repo = ChunkSnapshotRepo(args.repo)
+    if not repo.is_initialized():
+        print(f"!! repo not initialized: {args.repo}", file=sys.stderr)
+        return 2
+
+    if args.all and not args.from_level_dat:
+        print("!! --all requires --from-level-dat", file=sys.stderr)
+        return 2
+    if args.all and args.snapshot:
+        print("!! pass --all OR a snapshot id, not both", file=sys.stderr)
+        return 2
+    if not args.all and not args.snapshot:
+        print("!! supply a snapshot id (or use --all --from-level-dat)",
+              file=sys.stderr)
+        return 2
+    if args.timestamp and args.from_level_dat:
+        print("!! --timestamp and --from-level-dat are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if not args.timestamp and not args.from_level_dat:
+        print("!! supply --timestamp or --from-level-dat", file=sys.stderr)
+        return 2
+
+    explicit_ts: "datetime | None" = None
+    if args.timestamp:
+        try:
+            explicit_ts = datetime.fromisoformat(args.timestamp)
+        except ValueError as e:
+            print(f"!! invalid --timestamp {args.timestamp!r}: {e}",
+                  file=sys.stderr)
+            return 2
+        if explicit_ts.tzinfo is None:
+            explicit_ts = explicit_ts.replace(tzinfo=timezone.utc)
+
+    targets = repo.list() if args.all else [repo.get(args.snapshot)]
+    if not args.all and targets[0] is None:
+        print(f"!! no such snapshot: {args.snapshot!r}", file=sys.stderr)
+        return 2
+
+    if not args.dry_run:
+        bak = repo.backup_index()
+        print(f"# index backed up to {bak.name}")
+
+    changed = 0
+    skipped: list[tuple[str, str]] = []
+    for snap in targets:
+        try:
+            if explicit_ts is not None:
+                new_ts = explicit_ts
+                source = "explicit"
+            else:
+                manifest = read_manifest(snap.manifest_path)
+                lp_ms = manifest.header.last_played_ms
+                if not lp_ms:
+                    skipped.append((snap.short_id, "no LastPlayed in manifest"))
+                    continue
+                new_ts = datetime.fromtimestamp(lp_ms / 1000, tz=timezone.utc)
+                source = "last_played"
+            if int(new_ts.timestamp() * 1000) == int(snap.timestamp.timestamp() * 1000):
+                skipped.append((snap.short_id, "already at target timestamp"))
+                continue
+            if args.dry_run:
+                print(f"would retime {snap.short_id} ({snap.label or '-'})  "
+                      f"{snap.timestamp.isoformat()} → {new_ts.isoformat()}  "
+                      f"[{source}]")
+                changed += 1
+                continue
+            repo.retime_snapshot(snap, new_ts)
+            print(f"retimed {snap.short_id} ({snap.label or '-'})  "
+                  f"→ {new_ts.isoformat()}  [{source}]")
+            changed += 1
+        except ChunkRepoError as e:
+            skipped.append((snap.short_id, str(e)))
+
+    print(f"# {'would change' if args.dry_run else 'changed'}: {changed} / "
+          f"{len(targets)} snapshot(s)")
+    for sid, reason in skipped[:10]:
+        print(f"# skip {sid}: {reason}", file=sys.stderr)
+    if len(skipped) > 10:
+        print(f"# ... ({len(skipped) - 10} more skipped)", file=sys.stderr)
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     repo = _open_repo(args)
     for snap in repo.list():
@@ -520,6 +610,27 @@ def build_parser() -> argparse.ArgumentParser:
     vrt.add_argument("original", type=Path,
                      help="path to the original world to compare against")
     vrt.set_defaults(func=cmd_verify_roundtrip)
+
+    rt = sub.add_parser("retime",
+                        help="Reassign a snapshot's timeline timestamp. "
+                             "Useful when the original timestamp was wrong "
+                             "(e.g. a live snapshot defaulted to 'now' but "
+                             "the world was actually a 2023 backup).")
+    rt.add_argument("repo", type=Path)
+    rt.add_argument("snapshot", type=str, nargs="?",
+                    help="snap id or label (required unless --all)")
+    rt.add_argument("--timestamp", type=str, default=None,
+                    help="New timestamp (ISO8601, e.g. '2024-03-15T10:30:00')")
+    rt.add_argument("--from-level-dat", action="store_true",
+                    help="Re-derive timestamp from the manifest's stored "
+                         "level.dat LastPlayed field. Skips snapshots whose "
+                         "manifest has no usable LastPlayed.")
+    rt.add_argument("--all", action="store_true",
+                    help="Apply --from-level-dat to every snapshot in the "
+                         "repo (only valid with --from-level-dat).")
+    rt.add_argument("--dry-run", action="store_true",
+                    help="Report what would change without writing anything.")
+    rt.set_defaults(func=cmd_retime)
 
     ll = sub.add_parser("logs-list", help="List log snapshots.")
     ll.add_argument("repo", type=Path)

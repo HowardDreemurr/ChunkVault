@@ -24,18 +24,19 @@ from pathlib import Path
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
-    id              TEXT PRIMARY KEY,
-    label           TEXT,
-    world_name      TEXT NOT NULL,
-    timestamp_ms    INTEGER NOT NULL,
-    manifest_path   TEXT NOT NULL,
-    mc_version      TEXT,
-    data_version    INTEGER,
-    chunk_count     INTEGER NOT NULL DEFAULT 0,
-    region_count    INTEGER NOT NULL DEFAULT 0,
-    file_count      INTEGER NOT NULL DEFAULT 0,
-    new_chunk_count INTEGER NOT NULL DEFAULT 0,
-    new_file_count  INTEGER NOT NULL DEFAULT 0
+    id                    TEXT PRIMARY KEY,
+    label                 TEXT,
+    world_name            TEXT NOT NULL,
+    timestamp_ms          INTEGER NOT NULL,
+    manifest_path         TEXT NOT NULL,
+    mc_version            TEXT,
+    data_version          INTEGER,
+    chunk_count           INTEGER NOT NULL DEFAULT 0,
+    region_count          INTEGER NOT NULL DEFAULT 0,
+    file_count            INTEGER NOT NULL DEFAULT 0,
+    new_chunk_count       INTEGER NOT NULL DEFAULT 0,
+    new_file_count        INTEGER NOT NULL DEFAULT 0,
+    original_timestamp_ms INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_label ON snapshots(label);
 CREATE INDEX IF NOT EXISTS idx_snapshots_world ON snapshots(world_name);
@@ -84,6 +85,10 @@ class SnapshotRow:
     file_count: int
     new_chunk_count: int
     new_file_count: int
+    # 0 (or NULL) = never retimed. Set on first retime to whatever
+    # timestamp_ms used to be, so we can audit "this snapshot's wall-clock
+    # placement was changed; here's where it was originally."
+    original_timestamp_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -113,6 +118,16 @@ class IndexDB:
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Add original_timestamp_ms to snapshots — populated on first retime,
+        # NULL/0 meaning "never retimed". Idempotent: ALTER TABLE raises
+        # OperationalError if the column already exists, swallow it.
+        try:
+            self._conn.execute(
+                "ALTER TABLE snapshots ADD COLUMN original_timestamp_ms "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.commit()
 
@@ -134,13 +149,56 @@ class IndexDB:
                 "INSERT INTO snapshots "
                 "(id, label, world_name, timestamp_ms, manifest_path, "
                 " mc_version, data_version, chunk_count, region_count, "
-                " file_count, new_chunk_count, new_file_count) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " file_count, new_chunk_count, new_file_count, "
+                " original_timestamp_ms) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row.id, row.label, row.world_name, row.timestamp_ms,
                  row.manifest_path, row.mc_version, row.data_version,
                  row.chunk_count, row.region_count, row.file_count,
-                 row.new_chunk_count, row.new_file_count),
+                 row.new_chunk_count, row.new_file_count,
+                 row.original_timestamp_ms),
             )
+
+    def update_snapshot_timestamp(
+        self, snap_id: str, new_timestamp_ms: int,
+        *, original_timestamp_ms: int | None = None,
+    ) -> bool:
+        """Update a snapshot row's timestamp, optionally seeding the audit field.
+
+        ``original_timestamp_ms`` is only written when non-None — pass the
+        previous timestamp on the FIRST retime of a given snapshot to
+        preserve "where it was before any tweaking". On subsequent retimes
+        of the same row, omit it so the original-original is kept.
+        """
+        with self._conn:
+            if original_timestamp_ms is not None:
+                cur = self._conn.execute(
+                    "UPDATE snapshots SET timestamp_ms = ?, "
+                    "original_timestamp_ms = ? WHERE id = ?",
+                    (new_timestamp_ms, original_timestamp_ms, snap_id),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE snapshots SET timestamp_ms = ? WHERE id = ?",
+                    (new_timestamp_ms, snap_id),
+                )
+            return cur.rowcount > 0
+
+    def find_snapshot_by_label_and_timestamp(
+        self, label: str, timestamp_ms: int,
+    ) -> str | None:
+        """Return the id of any snapshot already at this (label, timestamp).
+
+        Used by retime to refuse collisions — two distinct snapshots with
+        identical (label, timestamp) would make label-based lookups
+        non-deterministic and silently shadow each other.
+        """
+        cur = self._conn.execute(
+            "SELECT id FROM snapshots WHERE label = ? AND timestamp_ms = ?",
+            (label, timestamp_ms),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
 
     def remove_snapshot(self, snap_id: str) -> bool:
         with self._conn:
@@ -153,7 +211,8 @@ class IndexDB:
         cur = self._conn.execute(
             "SELECT id, label, world_name, timestamp_ms, manifest_path, "
             "mc_version, data_version, chunk_count, region_count, "
-            "file_count, new_chunk_count, new_file_count "
+            "file_count, new_chunk_count, new_file_count, "
+            "original_timestamp_ms "
             "FROM snapshots ORDER BY timestamp_ms DESC"
         )
         return [SnapshotRow(*row) for row in cur.fetchall()]
@@ -163,7 +222,8 @@ class IndexDB:
         cur = self._conn.execute(
             "SELECT id, label, world_name, timestamp_ms, manifest_path, "
             "mc_version, data_version, chunk_count, region_count, "
-            "file_count, new_chunk_count, new_file_count "
+            "file_count, new_chunk_count, new_file_count, "
+            "original_timestamp_ms "
             "FROM snapshots WHERE id = ?",
             (id_or_label,),
         )
@@ -174,7 +234,8 @@ class IndexDB:
         cur = self._conn.execute(
             "SELECT id, label, world_name, timestamp_ms, manifest_path, "
             "mc_version, data_version, chunk_count, region_count, "
-            "file_count, new_chunk_count, new_file_count "
+            "file_count, new_chunk_count, new_file_count, "
+            "original_timestamp_ms "
             "FROM snapshots WHERE label = ? "
             "ORDER BY timestamp_ms DESC LIMIT 1",
             (id_or_label,),
@@ -187,7 +248,8 @@ class IndexDB:
         cur = self._conn.execute(
             "SELECT id, label, world_name, timestamp_ms, manifest_path, "
             "mc_version, data_version, chunk_count, region_count, "
-            "file_count, new_chunk_count, new_file_count "
+            "file_count, new_chunk_count, new_file_count, "
+            "original_timestamp_ms "
             "FROM snapshots WHERE id LIKE ? "
             "ORDER BY timestamp_ms DESC LIMIT 1",
             (like,),
@@ -201,7 +263,8 @@ class IndexDB:
         cur = self._conn.execute(
             "SELECT id, label, world_name, timestamp_ms, manifest_path, "
             "mc_version, data_version, chunk_count, region_count, "
-            "file_count, new_chunk_count, new_file_count "
+            "file_count, new_chunk_count, new_file_count, "
+            "original_timestamp_ms "
             "FROM snapshots WHERE world_name = ? "
             "ORDER BY timestamp_ms DESC LIMIT 1",
             (world_name,),

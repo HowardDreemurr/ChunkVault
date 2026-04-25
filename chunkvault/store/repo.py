@@ -1273,6 +1273,118 @@ class ChunkSnapshotRepo:
 
     # ---- delete -------------------------------------------------------------
 
+    # ---- retime -------------------------------------------------------------
+
+    def backup_index(self) -> Path:
+        """Snapshot the SQLite index to ``index.sqlite.bak`` before risky ops.
+
+        Overwrites any previous .bak — we keep ONE rollback point, not a
+        history (the chunk pool itself is content-addressed and immutable;
+        only the index + manifests carry mutable state). Restore by copying
+        the .bak back over index.sqlite while no chunkvault process holds
+        the WAL.
+        """
+        from shutil import copy2
+        bak_path = self.index_path.with_name(self.index_path.name + ".bak")
+        if self.index_path.is_file():
+            copy2(self.index_path, bak_path)
+        return bak_path
+
+    def retime_snapshot(
+        self,
+        snapshot: ChunkSnapshot | str,
+        new_timestamp: datetime,
+    ) -> ChunkSnapshot:
+        """Reassign a snapshot's timeline position.
+
+        Atomic per snapshot: rewrite the manifest header, then update the
+        index row in a single SQL transaction. Refuses to retime to a
+        ``(label, timestamp)`` already occupied by another snapshot — a
+        collision would make label-based lookups silently shadow rows.
+
+        On the FIRST retime of a snapshot, the previous timestamp is
+        captured into both the manifest and the index as
+        ``original_timestamp_ms`` so the change is auditable. Subsequent
+        retimes preserve that original (so "where was this snapshot born?"
+        always answers, no matter how many times you adjust it).
+        """
+        snap = snapshot if isinstance(snapshot, ChunkSnapshot) else self.get(snapshot)
+        if snap is None:
+            raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
+        if not snap.manifest_path.is_file():
+            raise ChunkRepoError(
+                f"manifest missing for {snap.short_id}: {snap.manifest_path}"
+            )
+
+        new_ts_utc = new_timestamp.astimezone(timezone.utc)
+        new_ts_ms = int(new_ts_utc.timestamp() * 1000)
+
+        manifest = read_manifest(snap.manifest_path)
+        old_ts_ms = manifest.header.timestamp_ms
+        if old_ts_ms == new_ts_ms:
+            return snap  # no-op
+
+        # First retime captures the pre-existing timestamp as "original";
+        # subsequent retimes preserve that first-original (so audit always
+        # answers "where was this snapshot born?", not "what was it last").
+        first_retime = manifest.header.original_timestamp_ms == 0
+        new_original = (
+            old_ts_ms if first_retime else manifest.header.original_timestamp_ms
+        )
+
+        with IndexDB(self.index_path) as index:
+            # Collision: refuse if another snapshot already sits at this
+            # exact (label, timestamp). Retime to current ts was the no-op above.
+            existing_id = index.find_snapshot_by_label_and_timestamp(
+                manifest.header.label or "", new_ts_ms,
+            )
+            if existing_id is not None and existing_id != snap.id:
+                raise ChunkRepoError(
+                    f"refusing retime: snapshot {existing_id[:12]} already "
+                    f"sits at label={manifest.header.label!r} timestamp="
+                    f"{new_ts_utc.isoformat()}"
+                )
+
+            manifest.header.timestamp_ms = new_ts_ms
+            manifest.header.original_timestamp_ms = new_original
+            write_manifest(snap.manifest_path, manifest)
+
+            index.update_snapshot_timestamp(
+                snap.id, new_ts_ms,
+                original_timestamp_ms=new_original if first_retime else None,
+            )
+
+        return ChunkSnapshot(
+            id=snap.id, label=snap.label,
+            timestamp=new_ts_utc, world_name=snap.world_name,
+            mc_version=snap.mc_version, data_version=snap.data_version,
+            manifest_path=snap.manifest_path,
+        )
+
+    def retime_snapshot_from_manifest(
+        self, snapshot: ChunkSnapshot | str,
+    ) -> tuple[ChunkSnapshot, str]:
+        """Convenience: retime to ``manifest.header.last_played_ms``.
+
+        Returns ``(updated_snap, source)`` — ``source`` is "last_played" on
+        success, or "no_last_played" when the manifest doesn't carry one
+        (older v1 manifests, or v2 manifests where the field defaulted to
+        zero because LastPlayed wasn't readable at snapshot time). Raises
+        on the same conditions as ``retime_snapshot``.
+        """
+        snap = snapshot if isinstance(snapshot, ChunkSnapshot) else self.get(snapshot)
+        if snap is None:
+            raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
+        manifest = read_manifest(snap.manifest_path)
+        lp_ms = manifest.header.last_played_ms
+        if not lp_ms:
+            return snap, "no_last_played"
+        new_ts = datetime.fromtimestamp(lp_ms / 1000, tz=timezone.utc)
+        updated = self.retime_snapshot(snap, new_ts)
+        return updated, "last_played"
+
+    # ---- delete -------------------------------------------------------------
+
     def delete(self, snapshot: ChunkSnapshot | str) -> None:
         snap = snapshot if isinstance(snapshot, ChunkSnapshot) else self.get(snapshot)
         if snap is None:
