@@ -440,6 +440,29 @@ class ChunkSnapshotRepo:
                 kind="phase_done", phase="update_index",
             ))
 
+        snap_obj = ChunkSnapshot(
+            id=snap_id, label=label, timestamp=ts,
+            world_name=effective_world_name, mc_version=mc_version,
+            data_version=data_version, manifest_path=manifest_path,
+        )
+
+        # Render thumbnail tiles + per-dim PNG sidecars. Failures here
+        # never block the snapshot — the chunk pool is the durable record;
+        # tiles are a cheap derived artifact that backfill can rebuild later.
+        try:
+            from ..viz.snapshot_render import (
+                ensure_tiles_for_manifest, write_snapshot_sidecars,
+            )
+            ensure_tiles_for_manifest(self, manifest, progress_cb=progress_cb)
+            write_snapshot_sidecars(
+                self, snap_id, manifest, progress_cb=progress_cb,
+            )
+        except Exception as e:
+            _emit(progress_cb, ProgressEvent(
+                kind="warning", phase="render_tiles",
+                label=f"thumbnail render failed (snapshot still committed): {e}",
+            ))
+
         _emit(progress_cb, ProgressEvent(
             kind="finish", phase="snapshot",
             label=label or snap_id[:12],
@@ -449,11 +472,6 @@ class ChunkSnapshotRepo:
                 "file_count": file_count,
             },
         ))
-        snap_obj = ChunkSnapshot(
-            id=snap_id, label=label, timestamp=ts,
-            world_name=effective_world_name, mc_version=mc_version,
-            data_version=data_version, manifest_path=manifest_path,
-        )
 
         # Default-on round-trip self-check: restore the snapshot we just made
         # to a temp dir, walk the two trees in lockstep, fail loudly if the

@@ -353,6 +353,62 @@ def cmd_verify_roundtrip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_thumbnail(args: argparse.Namespace) -> int:
+    """Render thumbnail tiles + per-dim PNG sidecars for snapshots.
+
+    With ``--all`` walks every snapshot. Without, takes a single snapshot
+    id/label. Idempotent — already-cached tiles are skipped, sidecars
+    overwrite. Use this to backfill thumbnails for snapshots that were
+    ingested before the renderer existed (or whose render was skipped
+    due to a transient error).
+    """
+    from .store import ChunkSnapshotRepo
+    from .store.manifest import read_manifest
+    from .viz.snapshot_render import (
+        ensure_tiles_for_manifest, write_snapshot_sidecars,
+    )
+
+    repo = ChunkSnapshotRepo(args.repo)
+    if not repo.is_initialized():
+        print(f"!! repo not initialized: {args.repo}", file=sys.stderr)
+        return 2
+
+    if args.all and args.snapshot:
+        print("!! pass --all OR a snapshot id, not both", file=sys.stderr)
+        return 2
+    if not args.all and not args.snapshot:
+        print("!! supply a snapshot id (or use --all)", file=sys.stderr)
+        return 2
+
+    targets = repo.list() if args.all else [repo.get(args.snapshot)]
+    if not args.all and targets[0] is None:
+        print(f"!! no such snapshot: {args.snapshot!r}", file=sys.stderr)
+        return 2
+
+    rendered_total = 0
+    cached_total = 0
+    failed_total = 0
+    for snap in targets:
+        try:
+            manifest = read_manifest(snap.manifest_path)
+        except Exception as e:
+            print(f"!! {snap.short_id}: read manifest failed: {e}",
+                  file=sys.stderr)
+            continue
+        stats = ensure_tiles_for_manifest(repo, manifest)
+        rendered_total += stats.tiles_rendered
+        cached_total += stats.tiles_skipped_cached
+        failed_total += stats.chunks_failed
+        sidecars = write_snapshot_sidecars(repo, snap.id, manifest)
+        print(f"{snap.short_id}  {snap.label or '-':25}  "
+              f"rendered={stats.tiles_rendered}  cached={stats.tiles_skipped_cached}  "
+              f"failed={stats.chunks_failed}  sidecars={len(sidecars)}")
+
+    print(f"# total: rendered={rendered_total}  cached={cached_total}  "
+          f"failed={failed_total}  snapshots={len(targets)}")
+    return 0
+
+
 def cmd_retime(args: argparse.Namespace) -> int:
     """Reassign one or many snapshots' timestamps."""
     from datetime import datetime, timezone
@@ -610,6 +666,17 @@ def build_parser() -> argparse.ArgumentParser:
     vrt.add_argument("original", type=Path,
                      help="path to the original world to compare against")
     vrt.set_defaults(func=cmd_verify_roundtrip)
+
+    th = sub.add_parser("thumbnail",
+                        help="Render thumbnail tiles + per-dim PNG sidecars "
+                             "for one or all snapshots. Use --all to backfill "
+                             "snapshots ingested before the renderer existed.")
+    th.add_argument("repo", type=Path)
+    th.add_argument("snapshot", type=str, nargs="?",
+                    help="snap id or label (required unless --all)")
+    th.add_argument("--all", action="store_true",
+                    help="Process every snapshot in the repo.")
+    th.set_defaults(func=cmd_thumbnail)
 
     rt = sub.add_parser("retime",
                         help="Reassign a snapshot's timeline timestamp. "
