@@ -187,6 +187,64 @@ def test_corrupt_zlib_body_raises(tmp_path: Path):
 
 # ---- size sanity ------------------------------------------------------------
 
+# ---- v2 trailer (last_played_ms, original_timestamp_ms) --------------------
+
+def test_v2_roundtrip_preserves_trailer(tmp_path: Path):
+    """New fields survive a full write/read cycle."""
+    m = Manifest(header=ManifestHeader(
+        timestamp_ms=1, label="x", world_name="w",
+        last_played_ms=12345, original_timestamp_ms=999,
+    ))
+    out = tmp_path / "x.mcbk"
+    write_manifest(out, m)
+    loaded = read_manifest(out)
+    assert loaded.header.last_played_ms == 12345
+    assert loaded.header.original_timestamp_ms == 999
+
+
+def test_v2_default_trailer_is_zero(tmp_path: Path):
+    """Manifests written without explicit values get zeros for the trailer."""
+    m = Manifest(header=ManifestHeader(
+        timestamp_ms=1, label=None, world_name="w",
+    ))
+    out = tmp_path / "x.mcbk"
+    write_manifest(out, m)
+    loaded = read_manifest(out)
+    assert loaded.header.last_played_ms == 0
+    assert loaded.header.original_timestamp_ms == 0
+
+
+def test_v1_manifest_still_readable(tmp_path: Path):
+    """A pre-v2 manifest (no trailer) still loads; trailer defaults to zero."""
+    import zlib
+    # Hand-build a v1 body: ts + 3 strings + data_version + 0 dims + 0 files
+    body = bytearray()
+    body += struct.pack(">Q", 1_000)
+    # label (empty)
+    body += bytes([0])
+    # world_name "w"
+    body += bytes([1]); body += b"w"
+    # mc_version ""
+    body += bytes([0])
+    # data_version 0
+    body += struct.pack(">i", 0)
+    # n_dims = 0
+    body += bytes([0])
+    # n_files = 0
+    body += bytes([0])
+    compressed = zlib.compress(bytes(body), level=6)
+    file_bytes = MAGIC + bytes([1]) + struct.pack(">I", len(body)) + compressed
+
+    p = tmp_path / "v1.mcbk"
+    p.write_bytes(file_bytes)
+    loaded = read_manifest(p)
+    assert loaded.header.timestamp_ms == 1_000
+    assert loaded.header.world_name == "w"
+    # Trailer absent in v1 → defaults
+    assert loaded.header.last_played_ms == 0
+    assert loaded.header.original_timestamp_ms == 0
+
+
 def test_manifest_compresses_substantially(tmp_path: Path):
     """A manifest with thousands of chunks should compress better than 1:2."""
     m = Manifest(

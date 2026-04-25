@@ -10,10 +10,12 @@ from chunkvault.mca.nbt_lite import (
     TAG_COMPOUND,
     TAG_END,
     TAG_INT,
+    TAG_LONG,
     TAG_STRING,
     build_nbt_compound,
     decompress_chunk_payload,
     find_data_version,
+    find_last_played,
 )
 
 
@@ -140,6 +142,52 @@ def test_malformed_nbt_returns_none():
 def test_non_compound_root_returns_none():
     """If root tag isn't a compound, we can't proceed."""
     assert find_data_version(b"\x03fake non-compound") is None
+
+
+def _long_payload(value: int) -> bytes:
+    return value.to_bytes(8, "big", signed=True)
+
+
+# ---- find_last_played ------------------------------------------------------
+
+def test_last_played_inside_data_compound():
+    """Real layout: level.dat root → Data compound → LastPlayed (TAG_Long ms)."""
+    last_played_ms = 1_700_000_000_000
+    root = bytearray()
+    root.append(TAG_COMPOUND)
+    root += b"\x00\x00"  # empty root name
+    root.append(TAG_COMPOUND)
+    root += b"\x00\x04" + b"Data"
+    root.append(TAG_LONG)
+    root += b"\x00\x0A" + b"LastPlayed"
+    root += _long_payload(last_played_ms)
+    root.append(TAG_END)  # end of Data
+    root.append(TAG_END)  # end of root
+    assert find_last_played(bytes(root)) == last_played_ms
+
+
+def test_last_played_at_root():
+    """Some modded worlds put LastPlayed at root; we still find it."""
+    root = bytearray()
+    root.append(TAG_COMPOUND)
+    root += b"\x00\x00"
+    root.append(TAG_LONG)
+    root += b"\x00\x0A" + b"LastPlayed"
+    root += _long_payload(42)
+    root.append(TAG_END)
+    assert find_last_played(bytes(root)) == 42
+
+
+def test_last_played_absent_returns_none():
+    nbt = build_nbt_compound("", [
+        (TAG_INT, "DataVersion", _int_payload(3700)),
+    ])
+    assert find_last_played(nbt) is None
+
+
+def test_last_played_malformed_returns_none():
+    assert find_last_played(b"") is None
+    assert find_last_played(b"\xFF\xFF") is None
 
 
 def test_round_trip_compressed_chunk():

@@ -126,6 +126,52 @@ def _read_version_fields(f: BinaryIO) -> tuple[str | None, int | None]:
             _skip_payload(f, tag_type)
 
 
+def find_last_played(nbt_bytes: bytes) -> int | None:
+    """Locate ``Data.LastPlayed`` in a decompressed level.dat NBT.
+
+    Returns Unix-epoch milliseconds (TAG_Long) or None if absent. Doesn't
+    raise. ``LastPlayed`` is set by Minecraft every time the world is saved
+    — usually within seconds of the actual backup time, making it a far
+    better default snapshot timestamp than ``datetime.now()`` for any
+    world that wasn't taken at the moment ``chunkvault snapshot`` ran.
+    """
+    try:
+        f = io.BytesIO(nbt_bytes)
+        root_type = _read(f, 1)[0]
+        if root_type != TAG_COMPOUND:
+            return None
+        _read_string(f)  # root name (usually empty)
+        return _scan_last_played_in_compound(f, depth_left=3)
+    except (NBTError, ValueError, IndexError, UnicodeDecodeError):
+        return None
+
+
+def _scan_last_played_in_compound(
+    f: BinaryIO, depth_left: int,
+) -> int | None:
+    """Walk a compound looking for a TAG_Long ``LastPlayed`` field.
+
+    Mirrors ``_scan_version_in_compound``: descend into nested compounds
+    up to ``depth_left`` so we find ``Data.LastPlayed`` as well as
+    root-level placements seen in a few rare modded worlds.
+    """
+    found: int | None = None
+    while True:
+        tag_type = _read(f, 1)[0]
+        if tag_type == TAG_END:
+            return found
+        name = _read_string(f)
+        if tag_type == TAG_LONG and name == "LastPlayed" and found is None:
+            found = int.from_bytes(_read(f, 8), "big", signed=True)
+            continue
+        if tag_type == TAG_COMPOUND and depth_left > 0:
+            nested = _scan_last_played_in_compound(f, depth_left - 1)
+            if found is None:
+                found = nested
+            continue
+        _skip_payload(f, tag_type)
+
+
 def find_data_version(nbt_bytes: bytes, max_depth: int = 2) -> int | None:
     """Return the DataVersion int from a decompressed chunk NBT, or None.
 

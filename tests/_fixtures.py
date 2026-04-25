@@ -78,3 +78,46 @@ def write_mcc(root: Path, dimension_key: str, world_cx: int, world_cz: int,
     path = region_dir / f"c.{world_cx}.{world_cz}.mcc"
     path.write_bytes(payload)
     return path
+
+
+def write_level_dat(
+    world_root: Path,
+    *,
+    last_played_ms: int | None = None,
+    data_version: int | None = None,
+) -> Path:
+    """Write a minimal gzipped level.dat with optional LastPlayed / DataVersion.
+
+    The file structure mirrors what Minecraft writes: root TAG_Compound
+    containing a single ``Data`` TAG_Compound with the requested fields.
+    Fields default to absent so callers can selectively test detection.
+    """
+    import gzip
+    from chunkvault.mca.nbt_lite import (
+        TAG_COMPOUND, TAG_END, TAG_INT, TAG_LONG,
+    )
+
+    # Build the inner Data compound payload (children only, no leading tag/name).
+    data_children = bytearray()
+    if last_played_ms is not None:
+        data_children.append(TAG_LONG)
+        data_children += b"\x00\x0A" + b"LastPlayed"
+        data_children += last_played_ms.to_bytes(8, "big", signed=True)
+    if data_version is not None:
+        data_children.append(TAG_INT)
+        data_children += b"\x00\x0B" + b"DataVersion"
+        data_children += data_version.to_bytes(4, "big", signed=True)
+    data_children.append(TAG_END)
+
+    root = bytearray()
+    root.append(TAG_COMPOUND)
+    root += b"\x00\x00"            # empty root name
+    root.append(TAG_COMPOUND)
+    root += b"\x00\x04" + b"Data"  # Data compound
+    root += data_children
+    root.append(TAG_END)            # end of root
+
+    world_root.mkdir(parents=True, exist_ok=True)
+    path = world_root / "level.dat"
+    path.write_bytes(gzip.compress(bytes(root)))
+    return path

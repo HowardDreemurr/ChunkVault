@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from chunkvault.mca.nbt_lite import TAG_COMPOUND, TAG_INT, TAG_STRING, build_nbt_compound
+from chunkvault.mca.nbt_lite import (
+    TAG_COMPOUND, TAG_INT, TAG_LONG, TAG_STRING, build_nbt_compound,
+)
 from chunkvault.store import (
     ChunkRepoError,
     ChunkSnapshotRepo,
@@ -48,8 +50,15 @@ def _mk_world(tmp_path: Path, name: str = "world") -> Path:
     return world
 
 
-def _make_level_dat(name: str, data_version: int) -> bytes:
-    """Build a minimal gzipped level.dat with Data.Version.{Name,Id} and DataVersion."""
+def _make_level_dat(
+    name: str, data_version: int, last_played_ms: int | None = None,
+) -> bytes:
+    """Build a minimal gzipped level.dat.
+
+    Always includes ``Data.Version.{Name,Id}`` and ``Data.DataVersion``;
+    optionally includes ``Data.LastPlayed`` (TAG_Long, Unix ms) — set this
+    to test snapshot-timestamp auto-detection.
+    """
     # Inner Version compound: {Name: name, Id: data_version}
     name_b = name.encode("utf-8")
     version_compound_body = bytearray()
@@ -63,7 +72,7 @@ def _make_level_dat(name: str, data_version: int) -> bytes:
     version_compound_body += data_version.to_bytes(4, "big", signed=True)
     version_compound_body.append(0)  # TAG_End
 
-    # Data compound containing Version compound + DataVersion int
+    # Data compound containing Version compound + DataVersion int (+ optional LastPlayed)
     data_body = bytearray()
     data_body.append(TAG_COMPOUND)
     data_body += b"\x00\x07Version"
@@ -71,6 +80,10 @@ def _make_level_dat(name: str, data_version: int) -> bytes:
     data_body.append(TAG_INT)
     data_body += b"\x00\x0bDataVersion"
     data_body += data_version.to_bytes(4, "big", signed=True)
+    if last_played_ms is not None:
+        data_body.append(TAG_LONG)
+        data_body += b"\x00\x0aLastPlayed"
+        data_body += last_played_ms.to_bytes(8, "big", signed=True)
     data_body.append(0)  # end Data
 
     # Root compound (no name) containing Data
@@ -442,3 +455,68 @@ def test_mc_version_extracted_from_level_dat(tmp_path: Path):
     snap = repo.snapshot(world, label="v1.21")
     assert snap.mc_version == "1.21.0"
     assert snap.data_version == 3953
+
+
+# ---- snapshot timestamp auto-detection -------------------------------------
+
+def _seed_world_with_last_played(
+    tmp_path: Path, last_played_ms: int | None,
+) -> Path:
+    """Build a tiny world dir; optionally embed LastPlayed in level.dat."""
+    world = tmp_path / "world"
+    world.mkdir()
+    (world / "level.dat").write_bytes(
+        _make_level_dat("1.20.4", 3700, last_played_ms=last_played_ms),
+    )
+    write_region_file(world, "region", 0, 0, [
+        ChunkSpec(0, 0, 1, 2, b"chunk"),
+    ])
+    return world
+
+
+def test_snapshot_uses_last_played_when_present(tmp_path: Path):
+    """Default timestamp comes from level.dat's LastPlayed, not now()."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    last_played_ms = 1_700_000_000_000  # 2023-11-14T22:13:20 UTC
+    world = _seed_world_with_last_played(tmp_path, last_played_ms)
+    snap = repo.snapshot(world, label="auto-ts")
+    assert int(snap.timestamp.timestamp() * 1000) == last_played_ms
+
+
+def test_snapshot_explicit_timestamp_overrides_last_played(tmp_path: Path):
+    """Explicit timestamp wins over auto-detected LastPlayed."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _seed_world_with_last_played(tmp_path, 1_700_000_000_000)
+    explicit = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+    snap = repo.snapshot(world, label="manual", timestamp=explicit)
+    assert snap.timestamp == explicit
+
+
+def test_snapshot_falls_back_when_no_last_played(tmp_path: Path):
+    """No LastPlayed → use newest region mtime, not 'now'."""
+    import os
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _seed_world_with_last_played(tmp_path, last_played_ms=None)
+    # Force the region file to a known mtime in the past.
+    region_file = world / "region" / "r.0.0.mca"
+    target_mtime = 1_650_000_000.0  # 2022-04-15
+    os.utime(region_file, (target_mtime, target_mtime))
+    snap = repo.snapshot(world, label="mtime")
+    # mtime is per-second, give a small tolerance for FS truncation.
+    assert abs(snap.timestamp.timestamp() - target_mtime) < 2
+
+
+def test_snapshot_stores_last_played_in_manifest(tmp_path: Path):
+    """LastPlayed is preserved in the manifest header for later retime."""
+    from chunkvault.store.manifest import read_manifest
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    last_played_ms = 1_700_000_000_000
+    world = _seed_world_with_last_played(tmp_path, last_played_ms)
+    snap = repo.snapshot(world, label="lp")
+    manifest = read_manifest(snap.manifest_path)
+    assert manifest.header.last_played_ms == last_played_ms
+    assert manifest.header.original_timestamp_ms == 0  # never retimed

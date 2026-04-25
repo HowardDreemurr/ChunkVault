@@ -261,8 +261,24 @@ class ChunkSnapshotRepo:
                 f"contains level.dat (often <server>/world/)."
             )
 
-        ts = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        # Pick the snapshot's timestamp: explicit caller value wins, else
+        # auto-detect from level.dat's LastPlayed (best for copied/archived
+        # save folders where "now" is meaningless), else region mtime,
+        # else fall back to the current wall clock.
+        if timestamp is not None:
+            ts = timestamp.astimezone(timezone.utc)
+            ts_source = "explicit"
+        else:
+            detected, ts_source = _detect_world_timestamp(world)
+            ts = (detected or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            if detected is None:
+                ts_source = "now"
         ts_ms = int(ts.timestamp() * 1000)
+
+        # LastPlayed is also stored verbatim in the manifest — even when the
+        # user overrides the snapshot timestamp, knowing the world's intrinsic
+        # "last save" time is useful for retime --from-level-dat later.
+        last_played_ms = _read_level_dat_last_played(world) or 0
 
         mc_version, data_version = _read_level_dat_version(world)
 
@@ -273,10 +289,12 @@ class ChunkSnapshotRepo:
             world_name=effective_world_name,
             mc_version=mc_version or "",
             data_version=data_version or 0,
+            last_played_ms=last_played_ms,
         ))
         _emit(progress_cb, ProgressEvent(
             kind="phase_start", phase="snapshot",
-            label=f"snapshot {effective_world_name}",
+            label=f"snapshot {effective_world_name} (ts={ts.isoformat()}, "
+                  f"source={ts_source})",
         ))
 
         exclude_patterns = tuple(exclude) if exclude is not None else DEFAULT_EXCLUDE
@@ -1283,20 +1301,16 @@ class ChunkSnapshotRepo:
 
 # ---- helpers ----------------------------------------------------------------
 
-def _read_level_dat_version(world: Path) -> tuple[str | None, int | None]:
-    """Best-effort read of mc_version + data_version from a level.dat.
+def _level_dat_candidates(world: Path) -> list[Path]:
+    """Locate plausible level.dat paths for a directory.
 
     Tries ``world/level.dat`` first (when ``world`` IS the world dir), then
     falls back to a bounded search up to depth 2 (when ``world`` is a server
     root containing a world subdir like ``EX-Server/world/level.dat`` or
-    ``EX-Server/survival/level.dat``). Returns (None, None) if no readable
-    level.dat is found.
+    ``EX-Server/survival/level.dat``).
     """
     candidates = [world / "level.dat"]
     if not candidates[0].is_file():
-        # Search depth ≤ 2 — covers server_root/world/level.dat and
-        # server_root/<custom>/level.dat. Bounded so we don't scan a giant
-        # filesystem if the user points us somewhere weird.
         try:
             for child in world.iterdir():
                 if child.is_dir():
@@ -1305,19 +1319,81 @@ def _read_level_dat_version(world: Path) -> tuple[str | None, int | None]:
                         candidates.append(cand)
         except OSError:
             pass
+    return [c for c in candidates if c.is_file()]
 
-    for level in candidates:
-        if not level.is_file():
-            continue
-        try:
-            raw = level.read_bytes()
-            nbt = decompress_chunk_payload(1, raw)
-        except Exception:
+
+def _read_level_dat_nbt(level_path: Path) -> bytes | None:
+    """Decompress a level.dat to NBT bytes; return None on any failure."""
+    try:
+        raw = level_path.read_bytes()
+        return decompress_chunk_payload(1, raw)
+    except Exception:
+        return None
+
+
+def _read_level_dat_version(world: Path) -> tuple[str | None, int | None]:
+    """Best-effort read of mc_version + data_version from a level.dat."""
+    for level in _level_dat_candidates(world):
+        nbt = _read_level_dat_nbt(level)
+        if nbt is None:
             continue
         version = find_version_info(nbt)
         if version != (None, None):
             return version
     return None, None
+
+
+def _read_level_dat_last_played(world: Path) -> int | None:
+    """Best-effort read of ``Data.LastPlayed`` (Unix-epoch ms) from level.dat.
+
+    Returns None if no level.dat is found or the field is absent. ``LastPlayed``
+    is set whenever Minecraft saves the world, so it tracks "when this world
+    state was created" much more accurately than ``datetime.now()`` for
+    snapshots taken from copied/archived save folders.
+    """
+    from ..mca.nbt_lite import find_last_played
+    for level in _level_dat_candidates(world):
+        nbt = _read_level_dat_nbt(level)
+        if nbt is None:
+            continue
+        lp = find_last_played(nbt)
+        if lp is not None:
+            return lp
+    return None
+
+
+def _detect_world_timestamp(world: Path) -> tuple[datetime | None, str]:
+    """Pick the best available timestamp for a world directory.
+
+    Priority chain:
+
+    1. ``level.dat``'s ``LastPlayed`` field (NBT TAG_Long, Unix ms) — set
+       whenever Minecraft saves the world.
+    2. Newest ``region/*.mca`` mtime — when at least one region file was
+       last touched (close enough to last save when level.dat is missing
+       or pre-LastPlayed).
+    3. None (caller falls back to ``datetime.now()``).
+
+    Returns ``(timestamp, source)``. ``source`` is one of "last_played",
+    "region_mtime", or "none" — useful for telling the user where the
+    timestamp came from.
+    """
+    lp_ms = _read_level_dat_last_played(world)
+    if lp_ms is not None and lp_ms > 0:
+        return datetime.fromtimestamp(lp_ms / 1000, tz=timezone.utc), "last_played"
+
+    newest_mtime: float = 0.0
+    for region_dir in enumerate_region_dirs(world):
+        for _, _, region_path in iter_region_files(region_dir.path):
+            try:
+                mtime = region_path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+    if newest_mtime > 0:
+        return datetime.fromtimestamp(newest_mtime, tz=timezone.utc), "region_mtime"
+    return None, "none"
 
 
 def _walk_world_files(world: Path) -> Iterator[Path]:

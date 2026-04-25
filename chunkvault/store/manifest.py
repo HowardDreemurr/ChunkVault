@@ -17,7 +17,7 @@ We use a custom binary format (no msgpack/cbor dependencies) because:
 Layout (all multi-byte integers big-endian):
 
     magic              4  bytes  ``b"MCBK"``
-    format_version     1  byte   currently 1
+    format_version     1  byte   currently 2 (1 still readable)
     body_len           4  bytes  uncompressed body length (sanity check)
     body               variable  zlib-compressed body
 
@@ -46,6 +46,13 @@ Body (uncompressed):
     for each file:
         relative_path  str       posix path under world root
         sha256         32 bytes
+
+    --- v2 only (appended) ---
+    last_played_ms     8  bytes  level.dat's Data.LastPlayed (0 if unknown)
+    original_ts_ms     8  bytes  pre-retime timestamp (0 if never retimed)
+
+V1 manifests omit the trailing v2 block; the reader treats missing bytes
+as zeros so old vaults open seamlessly. New writes always emit v2.
 """
 from __future__ import annotations
 
@@ -57,7 +64,8 @@ from pathlib import Path
 from typing import BinaryIO
 
 MAGIC = b"MCBK"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_VERSIONS = (1, 2)
 EXTERNAL_FLAG = 0x80
 
 
@@ -101,8 +109,10 @@ class ManifestHeader:
     timestamp_ms: int
     label: str | None
     world_name: str
-    mc_version: str = ""        # "" if unknown
-    data_version: int = 0       # 0 if unknown
+    mc_version: str = ""           # "" if unknown
+    data_version: int = 0          # 0 if unknown
+    last_played_ms: int = 0        # level.dat Data.LastPlayed; 0 if unknown
+    original_timestamp_ms: int = 0 # pre-retime timestamp; 0 if never retimed
 
 
 @dataclass
@@ -180,6 +190,11 @@ def _encode_body(m: Manifest) -> bytes:
             )
         _write_str(buf, f.relative_path)
         buf += f.sha256
+
+    # V2 trailer: appended after the files block so V1 readers (which check
+    # for trailing data) would simply reject the new format. New readers
+    # detect the trailer by remaining bytes.
+    buf += struct.pack(">QQ", m.header.last_played_ms, m.header.original_timestamp_ms)
     return bytes(buf)
 
 
@@ -192,9 +207,10 @@ def read_manifest(path: Path | str) -> Manifest:
     if raw[:4] != MAGIC:
         raise ManifestError(f"bad magic: {raw[:4]!r}")
     version = raw[4]
-    if version != FORMAT_VERSION:
+    if version not in SUPPORTED_VERSIONS:
         raise ManifestError(
-            f"unsupported manifest version {version} (expected {FORMAT_VERSION})"
+            f"unsupported manifest version {version} "
+            f"(supported: {SUPPORTED_VERSIONS})"
         )
     body_len = struct.unpack(">I", raw[5:9])[0]
     try:
@@ -205,10 +221,10 @@ def read_manifest(path: Path | str) -> Manifest:
         raise ManifestError(
             f"body length mismatch: header says {body_len}, decompressed {len(body)}"
         )
-    return _decode_body(body)
+    return _decode_body(body, version)
 
 
-def _decode_body(body: bytes) -> Manifest:
+def _decode_body(body: bytes, version: int) -> Manifest:
     cursor = _Cursor(body)
     timestamp_ms = struct.unpack(">Q", cursor.read(8))[0]
     label = _read_str(cursor) or None
@@ -251,7 +267,14 @@ def _decode_body(body: bytes) -> Manifest:
         sha = cursor.read(32)
         manifest.files.append(FileRecord(relative_path=rel, sha256=sha))
 
-    if cursor.remaining() != 0:
+    # V2 trailer: last_played_ms (8) + original_timestamp_ms (8). V1 stops
+    # here. If the trailer is partially missing on a v2 manifest, treat it
+    # as zeros — not worth aborting the load over a single missing field.
+    if version >= 2 and cursor.remaining() >= 16:
+        header.last_played_ms, header.original_timestamp_ms = struct.unpack(
+            ">QQ", cursor.read(16),
+        )
+    elif cursor.remaining() != 0:
         raise ManifestError(
             f"trailing data: {cursor.remaining()} bytes after manifest body"
         )

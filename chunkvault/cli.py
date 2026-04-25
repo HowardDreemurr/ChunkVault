@@ -299,6 +299,17 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     if args.store == "chunk":
         # Round-trip verify is opt-OUT: runs by default, --no-verify skips.
         kwargs["verify_roundtrip"] = not args.no_verify
+    if args.timestamp:
+        from datetime import datetime, timezone
+        try:
+            ts = datetime.fromisoformat(args.timestamp)
+        except ValueError as e:
+            print(f"!! invalid --timestamp {args.timestamp!r}: {e}",
+                  file=sys.stderr)
+            return 2
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        kwargs["timestamp"] = ts
     try:
         snap = repo.snapshot(args.world, **kwargs)
     except Exception as e:
@@ -428,6 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-verify", action="store_true",
                    help="Skip the post-snapshot round-trip verification "
                         "(default: verify is ON; doubles snapshot time).")
+    s.add_argument("--timestamp", type=str, default=None,
+                   help="Override snapshot timestamp (ISO8601, e.g. "
+                        "'2024-03-15T10:30:00'). Default: read level.dat's "
+                        "LastPlayed, fall back to newest region mtime, then "
+                        "to current wall time.")
     s.set_defaults(func=cmd_snapshot)
 
     ls = sub.add_parser("list", help="List snapshots, newest first.")
