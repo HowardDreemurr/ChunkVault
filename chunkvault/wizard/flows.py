@@ -27,6 +27,7 @@ from .ui import (
     make_progress,
     prompt_path,
     render_environment,
+    render_op_intro,
 )
 
 
@@ -48,8 +49,11 @@ def run_wizard(console: Console | None = None) -> int:
             "the wizard will prompt you for paths to use.[/yellow]\n"
         )
 
+    first_loop = True
     while True:
-        choice = main_menu(console)
+        # Show full guide on first loop, abbreviated on subsequent
+        choice = main_menu(console, with_guide=first_loop)
+        first_loop = False
         if choice == "q":
             console.print("[dim]bye.[/dim]")
             return 0
@@ -64,14 +68,14 @@ def run_wizard(console: Console | None = None) -> int:
                 run_list_flow(console, env)
             elif choice == "v":
                 run_verify_flow(console, env)
+            elif choice == "f":
+                run_fsck_flow(console, env)
             elif choice == "g":
                 run_gc_flow(console, env)
         except KeyboardInterrupt:
             console.print("\n[yellow]cancelled.[/yellow]")
         except Exception as e:
             console.print(f"[red]error:[/red] {e}")
-        # Refresh the env summary after each operation so future menu trips
-        # see updated counts.
         env = detect_environment()
 
 
@@ -96,6 +100,15 @@ def run_ingest_flow(
     console: Console, env: EnvironmentSummary,
 ) -> list[IngestResult]:
     """Bulk-import backup archives — the user's main use case."""
+    render_op_intro(
+        console, "Ingest archives",
+        "Bulk-import backup .zip / .tar.gz files. The wizard scans the "
+        "source folder(s) you give it, peeks inside each archive to "
+        "detect server folders + worlds + logs, shows you a preview, "
+        "then asks confirm before doing anything.",
+        expects="A folder containing backup archive files.",
+        example="D:\\day_backups\\  (with files like 2024-08-15-...zip inside)",
+    )
     repo = _pick_or_create_repo(console, env)
 
     # Collect candidate source paths
@@ -224,8 +237,20 @@ def run_ingest_flow(
 # ---- single snapshot ----------------------------------------------------
 
 def run_snapshot_flow(console: Console, env: EnvironmentSummary):
+    render_op_intro(
+        console, "Snapshot a live world",
+        "Take a snapshot of one specific MC world directory. Don't pick "
+        "this for archive folders — use [bold]Ingest archives[/bold] for "
+        ".zip files. The directory you give must contain "
+        "[yellow]level.dat[/yellow] or a [yellow]region/[/yellow] "
+        "subdirectory; the wizard will refuse if it doesn't look like a "
+        "real world (so a typo doesn't burn 80 GB of garbage into the vault).",
+        expects="A single MC world/ directory (containing level.dat or region/).",
+        example="D:\\servers\\smp\\world  (NOT D:\\servers\\smp — point at the world subdir)",
+    )
     repo = _pick_or_create_repo(console, env)
-    world = prompt_path(console, "World directory", must_exist=True)
+    world = prompt_path(console, "World directory (must contain level.dat or region/)",
+                        must_exist=True)
     label = console.input("Label (blank for none): ").strip() or None
     allow_live = confirm(console, "Allow snapshotting a live world?", default=False)
     verify_after = confirm(
@@ -266,6 +291,14 @@ def run_snapshot_flow(console: Console, env: EnvironmentSummary):
 # ---- diff ---------------------------------------------------------------
 
 def run_diff_flow(console: Console, env: EnvironmentSummary):
+    render_op_intro(
+        console, "Diff snapshots",
+        "Compare any two snapshots already in the vault. Pure manifest "
+        "lookup, no disk I/O — completes in milliseconds regardless of "
+        "world size. Reports added / modified / removed chunks per "
+        "dimension and (for cross-version snapshots) the MC version delta.",
+        expects="Two snapshot identifiers (label or short id) from the same vault.",
+    )
     repo = _pick_or_create_repo(console, env)
     snaps = repo.list()
     if len(snaps) < 2:
@@ -294,6 +327,12 @@ def run_diff_flow(console: Console, env: EnvironmentSummary):
 # ---- list ---------------------------------------------------------------
 
 def run_list_flow(console: Console, env: EnvironmentSummary):
+    render_op_intro(
+        console, "List snapshots",
+        "Show every world snapshot and log snapshot currently in the "
+        "vault, newest first.",
+        expects="Just the vault path — no source data needed.",
+    )
     repo = _pick_or_create_repo(console, env)
     snaps = repo.list()
     log_snaps = repo.list_log_snapshots()
@@ -314,6 +353,15 @@ def run_list_flow(console: Console, env: EnvironmentSummary):
 # ---- verify -------------------------------------------------------------
 
 def run_verify_flow(console: Console, env: EnvironmentSummary):
+    render_op_intro(
+        console, "Verify integrity",
+        "Walk every blob in the vault and re-hash it; flag any blob "
+        "whose contents don't match its file name (= silent disk bit-rot). "
+        "Also cross-checks that every chunk referenced by a manifest "
+        "actually exists on disk. Slow (proportional to vault size) but "
+        "the gold standard for 'is my backup still healthy?'.",
+        expects="Just the vault path.",
+    )
     repo = _pick_or_create_repo(console, env)
     repair = confirm(console, "Repair (delete) corrupt blobs?", default=False)
     console.print("[dim]verifying…[/dim]")
@@ -330,6 +378,14 @@ def run_verify_flow(console: Console, env: EnvironmentSummary):
 # ---- gc -----------------------------------------------------------------
 
 def run_gc_flow(console: Console, env: EnvironmentSummary):
+    render_op_intro(
+        console, "Garbage-collect",
+        "Reclaim disk space from blobs that no remaining snapshot "
+        "references. Run this after [bold]Delete[/bold] (CLI only — "
+        "wizard doesn't let you delete) or after fsck removes orphan "
+        "manifests.",
+        expects="Just the vault path.",
+    )
     repo = _pick_or_create_repo(console, env)
     if not confirm(console, "Run gc now?", default=True):
         return
@@ -338,3 +394,28 @@ def run_gc_flow(console: Console, env: EnvironmentSummary):
         f"[green]gc done[/green]  "
         f"chunks={result.chunks} files={result.files} logs={result.logs}"
     )
+
+
+def run_fsck_flow(console: Console, env: EnvironmentSummary):
+    render_op_intro(
+        console, "Fsck (repair)",
+        "Reconcile the vault's on-disk state with the index. Fixes "
+        "half-written snapshots left behind by Ctrl-C / kill / power-loss: "
+        "deletes orphan manifests, reverses dangling refs, removes "
+        "stray .tmp files. Idempotent and safe to run any time.",
+        expects="Just the vault path.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    dry_run = confirm(console, "Dry-run only (just report, don't fix)?",
+                      default=False)
+    report = repo.fsck(repair=not dry_run)
+    if report.clean:
+        console.print("[green]fsck: clean — no issues found[/green]")
+        return
+    console.print(f"[yellow]{report.summary()}[/yellow]")
+    for path in report.orphan_manifests[:10]:
+        console.print(f"  orphan manifest: {path}")
+    for snap_id in report.dangling_rows[:10]:
+        console.print(f"  dangling row: {snap_id}")
+    for path in report.stray_temp_files[:10]:
+        console.print(f"  stray .tmp file: {path}")

@@ -167,34 +167,96 @@ def render_archive_preview(console: Console, preview: ArchivePreview) -> None:
 # ---- prompts --------------------------------------------------------------
 
 _MENU_CHOICES = [
-    questionary.Choice("Ingest archives  (bulk-import backup zips)", value="i"),
-    questionary.Choice("Snapshot a live world",                       value="s"),
-    questionary.Choice("Diff two snapshots",                          value="d"),
-    questionary.Choice("List snapshots",                              value="l"),
-    questionary.Choice("Verify repo integrity",                       value="v"),
-    questionary.Choice("Garbage-collect (reclaim space)",             value="g"),
-    questionary.Choice("Quit",                                        value="q"),
+    questionary.Choice(
+        "Ingest archives    │ for bulk-importing .zip/.tar.gz backup files",
+        value="i"),
+    questionary.Choice(
+        "Snapshot a world   │ for a live MC server's world/ directory",
+        value="s"),
+    questionary.Choice(
+        "Diff snapshots     │ compare any two snapshots already in the vault",
+        value="d"),
+    questionary.Choice(
+        "List snapshots     │ show what's in the vault",
+        value="l"),
+    questionary.Choice(
+        "Verify integrity   │ rehash every blob, detect bit-rot",
+        value="v"),
+    questionary.Choice(
+        "Fsck (repair)      │ clean up after Ctrl-C / kill / power-loss",
+        value="f"),
+    questionary.Choice(
+        "Garbage-collect    │ reclaim space from deleted snapshots",
+        value="g"),
+    questionary.Choice(
+        "Quit",
+        value="q"),
 ]
 
 
-def main_menu(console: Console) -> str:
-    """Arrow-key main menu. Returns the chosen action key (i/s/d/l/v/g/q).
+def render_menu_guide(console: Console) -> None:
+    """Show a guide panel BEFORE the menu so the user knows what each
+    operation expects as input."""
+    console.print(Panel.fit(
+        "[bold cyan]Ingest archives[/bold cyan] — pick this for "
+        "[bold]a folder of backup .zip files[/bold] (e.g. `D:\\day_backups\\`).\n"
+        "    The wizard finds every archive, peeks inside each one, shows you\n"
+        "    what servers + worlds + logs it found, then asks confirm.\n"
+        "\n"
+        "[bold cyan]Snapshot a world[/bold cyan] — pick this for "
+        "[bold]a single live MC world directory[/bold]\n"
+        "    (the one containing [yellow]level.dat[/yellow] and "
+        "[yellow]region/[/yellow], e.g. `D:\\server\\world\\`).\n"
+        "    Don't point this at the server root — point at the "
+        "[bold]world/[/bold] subdir.\n"
+        "\n"
+        "[bold cyan]Diff snapshots[/bold cyan] — compare any two snapshots "
+        "you already took.\n"
+        "[bold cyan]List snapshots[/bold cyan] — see everything currently in the vault.\n"
+        "[bold cyan]Verify integrity[/bold cyan] — rehash every blob; "
+        "catches disk bit-rot.\n"
+        "[bold cyan]Fsck (repair)[/bold cyan] — fixes half-written state from "
+        "Ctrl-C / kill.\n"
+        "[bold cyan]Garbage-collect[/bold cyan] — reclaims disk space "
+        "after `delete`.",
+        title="What each operation does",
+        border_style="cyan",
+    ))
 
-    Falls back to a typed prompt if questionary can't take over the
-    terminal (e.g. running in a non-interactive shell or a captured
-    pytest stdin).
+
+def main_menu(console: Console, *, with_guide: bool = True) -> str:
+    """Arrow-key main menu. Returns the chosen action key.
+
+    When ``with_guide`` is True (default), prints a guidance panel above
+    the menu describing what each operation does + what input it expects.
     """
+    if with_guide:
+        render_menu_guide(console)
     answer = questionary.select(
         "What would you like to do?",
         choices=_MENU_CHOICES,
         default=_MENU_CHOICES[0],
         style=_QSTYLE,
-        instruction="(use ↑↓ arrows to move, Enter to select)",
+        instruction="(↑↓ to move, Enter to select)",
     ).ask()
     if answer is None:
-        # User pressed Ctrl-C / Esc — treat as quit
         return "q"
     return answer
+
+
+# ---- per-operation pre-flight panels --------------------------------------
+
+def render_op_intro(
+    console: Console, title: str, body: str, *, expects: str | None = None,
+    example: str | None = None,
+) -> None:
+    """A consistent "you picked X — here's what we're about to do" block."""
+    text = body
+    if expects:
+        text += f"\n\n[bold]Expects:[/bold] {expects}"
+    if example:
+        text += f"\n[bold]Example:[/bold] [yellow]{example}[/yellow]"
+    console.print(Panel(text, title=title, border_style="cyan", padding=(0, 1)))
 
 
 def prompt_path(
