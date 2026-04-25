@@ -46,8 +46,10 @@ from .repo import (
     ChunkRepoError,
     ChunkSnapshot,
     ChunkSnapshotRepo,
+    FsckReport,
     GCResult,
     LogSnapshot,
+    RoundTripVerificationError,
     VerifyReport,
 )
 
@@ -67,6 +69,8 @@ __all__ = [
     "ChunkSnapshotRepo",
     "VerifyReport",
     "GCResult",
+    "FsckReport",
+    "RoundTripVerificationError",
     "LogSnapshot",
     "LogStore",
     "LogFileRecord",

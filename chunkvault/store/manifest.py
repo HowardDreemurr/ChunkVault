@@ -49,6 +49,7 @@ Body (uncompressed):
 """
 from __future__ import annotations
 
+import os
 import struct
 import zlib
 from dataclasses import dataclass, field
@@ -114,7 +115,13 @@ class Manifest:
 # ---- writer -----------------------------------------------------------------
 
 def write_manifest(out_path: Path | str, manifest: Manifest) -> int:
-    """Serialize ``manifest`` to ``out_path``. Returns bytes written."""
+    """Serialize ``manifest`` to ``out_path`` atomically.
+
+    Writes to a sibling temp file first, then renames into place. A Ctrl-C
+    or kill mid-write leaves either the previous version (if any) or
+    nothing — never a half-written file that would later be misread as
+    a complete manifest.
+    """
     body = _encode_body(manifest)
     compressed = zlib.compress(body, level=6)
     out = bytearray()
@@ -122,7 +129,18 @@ def write_manifest(out_path: Path | str, manifest: Manifest) -> int:
     out.append(FORMAT_VERSION)
     out += struct.pack(">I", len(body))
     out += compressed
-    Path(out_path).write_bytes(bytes(out))
+
+    out_path = Path(out_path)
+    tmp = out_path.with_name(f"{out_path.name}.tmp.{os.getpid()}")
+    tmp.write_bytes(bytes(out))
+    try:
+        os.replace(tmp, out_path)        # atomic on every supported OS
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return len(out)
 
 

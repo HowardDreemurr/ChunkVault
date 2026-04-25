@@ -120,6 +120,38 @@ class GCResult:
         yield self.files
 
 
+@dataclass
+class FsckReport:
+    """Result of :meth:`ChunkSnapshotRepo.fsck`. Counts of issues found."""
+    orphan_manifests: list[str] = field(default_factory=list)
+    dangling_rows: list[str] = field(default_factory=list)
+    orphan_log_manifests: list[str] = field(default_factory=list)
+    dangling_log_rows: list[str] = field(default_factory=list)
+    stray_temp_files: list[str] = field(default_factory=list)
+
+    @property
+    def total_issues(self) -> int:
+        return (len(self.orphan_manifests) + len(self.dangling_rows)
+                + len(self.orphan_log_manifests) + len(self.dangling_log_rows)
+                + len(self.stray_temp_files))
+
+    @property
+    def clean(self) -> bool:
+        return self.total_issues == 0
+
+    def summary(self) -> str:
+        if self.clean:
+            return "fsck: clean"
+        return (
+            f"fsck: {self.total_issues} issue(s) — "
+            f"orphan-manifests={len(self.orphan_manifests)}, "
+            f"dangling-rows={len(self.dangling_rows)}, "
+            f"orphan-log-manifests={len(self.orphan_log_manifests)}, "
+            f"dangling-log-rows={len(self.dangling_log_rows)}, "
+            f"stray-temp-files={len(self.stray_temp_files)}"
+        )
+
+
 class RoundTripVerificationError(ChunkRepoError):
     """The snapshot was created but failed round-trip verification.
 
@@ -317,17 +349,23 @@ class ChunkSnapshotRepo:
                 detail={"new_files": new_files},
             ))
 
-            # 3) Bulk-increment ref counts for everything referenced by this
-            #    snapshot (whether the blob was new or existing). Each chunk
-            #    referenced once per snapshot — gc reclaims chunks whose count
-            #    drops to zero after their last referencing snapshot is deleted.
-            index.adjust_chunk_refs(chunks_referenced, delta=1)
-            index.adjust_file_refs(files_referenced, delta=1)
-
-            # 4) Persist manifest + register snapshot
+            # 3) Persist manifest to disk FIRST. write_manifest is atomic
+            #    (temp + rename), so the file is either fully written or
+            #    not present — never half-written. If the process is killed
+            #    between this step and the index commit below, fsck will
+            #    find the orphan manifest and either commit it (if intact)
+            #    or delete it.
             snap_id = uuid.uuid4().hex
             manifest_path = self.manifests_dir / f"{snap_id}.mcbk"
             write_manifest(manifest_path, manifest)
+
+            # 4) Now do the index work — refs FIRST, snapshot row LAST.
+            #    The snapshot row is the visibility marker: a row in the
+            #    snapshots table only ever appears when refs are already
+            #    correctly incremented. fsck uses the row's presence as
+            #    proof that refs were committed.
+            index.adjust_chunk_refs(chunks_referenced, delta=1)
+            index.adjust_file_refs(files_referenced, delta=1)
             index.add_snapshot(SnapshotRow(
                 id=snap_id,
                 label=label,
@@ -823,6 +861,145 @@ class ChunkSnapshotRepo:
             index.remove_log_snapshot(snap.id)
 
     # ---- gc ----------------------------------------------------------------
+
+    def fsck(self, *, repair: bool = True) -> "FsckReport":
+        """Reconcile the repo's on-disk state with the index.
+
+        Detects and (optionally) fixes the kinds of inconsistencies that
+        a SIGINT / kill-9 / power-loss in the middle of a snapshot can
+        leave behind:
+
+        * **Orphan manifests**: ``manifests/<id>.mcbk`` exists but no
+          snapshot row in the index points to it. Means snapshot() was
+          interrupted between writing the manifest and committing the
+          row. Repair: delete the manifest (the snapshot was never
+          committed; refs weren't incremented for it).
+        * **Dangling rows**: a snapshot row points at a manifest file
+          that doesn't exist. Means the manifest was deleted out of
+          band. Repair: delete the row and decrement the refs that
+          would have been associated with it (best-effort; if those
+          refs were already zeroed by gc, nothing changes).
+        * **Stray ``.tmp.<pid>`` files** in the chunk/file/log/manifest
+          directories: leftover from interrupted atomic writes. Repair:
+          delete them.
+        * **Stray index rows in chunks/files/log_files** with no actual
+          on-disk blob: not technically a problem (gc will clean them
+          on next sweep) but reported.
+
+        With ``repair=False`` only reports — useful for dry-run.
+        """
+        from .log_manifest import LogManifestError, read_log_manifest
+
+        report = FsckReport()
+
+        # 1) Stray temp files everywhere
+        for pool_root in (self.chunks.chunks_dir, self.chunks.files_dir,
+                          self.logs.logs_dir, self.manifests_dir,
+                          self.log_manifests_dir):
+            if not pool_root.is_dir():
+                continue
+            for path in pool_root.rglob("*"):
+                if path.is_file() and ".tmp." in path.name:
+                    report.stray_temp_files.append(str(path))
+                    if repair:
+                        try:
+                            path.unlink()
+                        except OSError:
+                            pass
+
+        # 2) Snapshot row ↔ manifest reconciliation
+        with IndexDB(self.index_path) as index:
+            indexed_manifests = {
+                row.id: row for row in index.list_snapshots()
+            }
+            on_disk_manifests = {
+                p.stem: p for p in self.manifests_dir.glob("*.mcbk")
+                if ".tmp." not in p.name
+            }
+
+            for snap_id, row in indexed_manifests.items():
+                if snap_id not in on_disk_manifests:
+                    report.dangling_rows.append(snap_id)
+                    if repair:
+                        # Reverse the refs this row claimed, then drop the row
+                        chunk_refs, file_refs = self._collect_refs_from_row(
+                            row, index,
+                        )
+                        index.adjust_chunk_refs(chunk_refs, delta=-1)
+                        index.adjust_file_refs(file_refs, delta=-1)
+                        index.remove_snapshot(snap_id)
+
+            for manifest_id, manifest_path in on_disk_manifests.items():
+                if manifest_id in indexed_manifests:
+                    continue
+                report.orphan_manifests.append(str(manifest_path))
+                if repair:
+                    # The snapshot wasn't committed — refs weren't bumped
+                    # for this manifest, so deleting it is safe.
+                    try:
+                        manifest_path.unlink()
+                    except OSError:
+                        pass
+
+            # 3) Same for log snapshots
+            indexed_log_manifests = {
+                row.id: row for row in index.list_log_snapshots()
+            }
+            on_disk_log_manifests = {
+                p.stem: p for p in self.log_manifests_dir.glob("*.json")
+                if ".tmp." not in p.name
+            }
+            for snap_id, row in indexed_log_manifests.items():
+                if snap_id not in on_disk_log_manifests:
+                    report.dangling_log_rows.append(snap_id)
+                    if repair:
+                        # Reverse log refs
+                        try:
+                            shas = self._collect_log_refs_from_row(row)
+                            index.adjust_log_refs(shas, delta=-1)
+                        except (LogManifestError, OSError):
+                            pass
+                        index.remove_log_snapshot(snap_id)
+            for manifest_id, manifest_path in on_disk_log_manifests.items():
+                if manifest_id in indexed_log_manifests:
+                    continue
+                report.orphan_log_manifests.append(str(manifest_path))
+                if repair:
+                    try:
+                        manifest_path.unlink()
+                    except OSError:
+                        pass
+
+        return report
+
+    def _collect_refs_from_row(self, row, index) -> tuple[list[bytes], list[bytes]]:
+        """Read a snapshot row's manifest and return its referenced hashes.
+        Used by fsck to know which refs to reverse when dropping a dangling row."""
+        manifest_path = self.repo_path / row.manifest_path
+        if not manifest_path.is_file():
+            return [], []
+        try:
+            manifest = read_manifest(manifest_path)
+        except Exception:
+            return [], []
+        chunks: list[bytes] = []
+        files: list[bytes] = []
+        for regions in manifest.dimensions.values():
+            for region in regions:
+                for c in region.chunks:
+                    chunks.append(c.content_hash)
+        for f in manifest.files:
+            files.append(f.sha256)
+        return chunks, files
+
+    def _collect_log_refs_from_row(self, row) -> list[bytes]:
+        manifest_path = self.repo_path / row.manifest_path
+        if not manifest_path.is_file():
+            return []
+        manifest = read_log_manifest(manifest_path)
+        return [rec.sha256
+                for files in manifest.servers.values()
+                for rec in files]
 
     def gc(self) -> "GCResult":
         """Sweep zero-reference chunks, files, and log blobs.

@@ -144,6 +144,27 @@ def cmd_diff_snaps(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fsck(args: argparse.Namespace) -> int:
+    """Reconcile on-disk state with the index — fixes half-written snapshots
+    left behind by Ctrl-C / kill / power-loss."""
+    from .store import ChunkSnapshotRepo
+    repo = ChunkSnapshotRepo(args.repo)
+    report = repo.fsck(repair=not args.dry_run)
+    print(report.summary())
+    if not report.clean and args.verbose:
+        for path in report.orphan_manifests[:20]:
+            print(f"  orphan manifest: {path}", file=sys.stderr)
+        for snap_id in report.dangling_rows[:20]:
+            print(f"  dangling row: {snap_id}", file=sys.stderr)
+        for snap_id in report.dangling_log_rows[:20]:
+            print(f"  dangling log row: {snap_id}", file=sys.stderr)
+        for path in report.orphan_log_manifests[:20]:
+            print(f"  orphan log manifest: {path}", file=sys.stderr)
+        for path in report.stray_temp_files[:20]:
+            print(f"  stray .tmp file: {path}", file=sys.stderr)
+    return 0
+
+
 def cmd_gc(args: argparse.Namespace) -> int:
     repo = _open_repo(args)
     if args.store == "git":
@@ -451,6 +472,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(git store only) extra-aggressive repack.")
     g.set_defaults(func=cmd_gc)
 
+    fck = sub.add_parser("fsck",
+                         help="Reconcile on-disk state with the index. "
+                              "Fixes half-written snapshots left by Ctrl-C "
+                              "or power-loss. (Chunk store only.)")
+    fck.add_argument("repo", type=Path)
+    fck.add_argument("--dry-run", action="store_true",
+                     help="Report issues without fixing them.")
+    fck.add_argument("--verbose", "-v", action="store_true",
+                     help="List each issue.")
+    fck.set_defaults(func=cmd_fsck)
+
     ing = sub.add_parser("ingest",
                          help="Ingest a multi-server archive: snapshot each "
                               "<server>/world to chunk store, capture logs "
@@ -526,10 +558,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not getattr(args, "func", None):
-        # No subcommand → wizard
-        return cmd_wizard(args)
-    return args.func(args)
+    try:
+        if not getattr(args, "func", None):
+            return cmd_wizard(args)
+        return args.func(args)
+    except KeyboardInterrupt:
+        # Friendly exit on Ctrl-C / Ctrl-Break — never dump a traceback.
+        # Exit code 130 is the POSIX convention for SIGINT.
+        print("\n[interrupted by user]", file=sys.stderr)
+        print("If you Ctrl-C'd in the middle of a snapshot, run "
+              "`chunkvault fsck <repo>` to clean up any half-written state.",
+              file=sys.stderr)
+        return 130
+    except BrokenPipeError:
+        # Piping into `head` etc. — silent exit
+        return 0
 
 
 if __name__ == "__main__":

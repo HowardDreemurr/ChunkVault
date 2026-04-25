@@ -29,6 +29,7 @@ Schema:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class LogManifest:
 
 
 def write_log_manifest(out_path: Path | str, manifest: LogManifest) -> int:
+    """Atomic write — same temp+rename robustness as the binary manifest."""
     payload = {
         "id": manifest.id,
         "label": manifest.label,
@@ -74,7 +76,17 @@ def write_log_manifest(out_path: Path | str, manifest: LogManifest) -> int:
         },
     }
     text = json.dumps(payload, indent=2, sort_keys=True)
-    Path(out_path).write_text(text, encoding="utf-8")
+    out_path = Path(out_path)
+    tmp = out_path.with_name(f"{out_path.name}.tmp.{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        os.replace(tmp, out_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return len(text.encode("utf-8"))
 
 
