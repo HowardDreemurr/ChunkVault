@@ -199,6 +199,49 @@ def test_cli_brokenpipeerror_exits_silently(monkeypatch, capsys):
     assert rc == 0
 
 
+# ---- snapshot UX defense: reject non-world directories ---------------------
+
+def test_snapshot_refuses_non_world_directory(tmp_path: Path):
+    """Pointing snapshot() at a directory that isn't a MC world (no
+    level.dat, no region/) must error early — not silently store every
+    unrelated file in the directory."""
+    from chunkvault.store import ChunkRepoError
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    # A folder full of zip files, NOT a MC world
+    fake_world = tmp_path / "archives"
+    fake_world.mkdir()
+    (fake_world / "backup1.zip").write_bytes(b"x")
+    (fake_world / "backup2.zip").write_bytes(b"y")
+    with pytest.raises(ChunkRepoError, match="doesn't look like a Minecraft world"):
+        repo.snapshot(fake_world, label="oops")
+
+
+def test_snapshot_accepts_world_with_just_level_dat(tmp_path: Path):
+    """level.dat alone should be enough to count as a world (e.g. a brand-new
+    server that hasn't generated any region files yet)."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = tmp_path / "fresh-world"
+    world.mkdir()
+    (world / "level.dat").write_bytes(b"placeholder")
+    snap = repo.snapshot(world, label="fresh", verify_roundtrip=False)
+    assert snap.label == "fresh"
+
+
+def test_snapshot_accepts_world_with_just_region_dir(tmp_path: Path):
+    """region/ dir alone should be enough (some servers strip level.dat)."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = tmp_path / "regions-only"
+    world.mkdir()
+    write_region_file(world, "region", 0, 0, [
+        ChunkSpec(0, 0, 1, 2, b"x"),
+    ])
+    snap = repo.snapshot(world, label="ro", verify_roundtrip=False)
+    assert snap.label == "ro"
+
+
 # ---- snapshot order: manifest before index commit --------------------------
 
 def test_snapshot_writes_manifest_before_committing_index(tmp_path: Path,

@@ -248,6 +248,19 @@ class ChunkSnapshotRepo:
             from ..storage.repo import _check_session_lock
             _check_session_lock(world)
 
+        # Sanity: a real MC world has level.dat OR a region/ subdir. Anything
+        # else is probably a user pointing at the wrong directory (the
+        # archive folder, the parent dir, the vault itself, etc.) — warn
+        # loudly, not silently snapshot 84 unrelated files.
+        if not _looks_like_mc_world(world):
+            raise ChunkRepoError(
+                f"{world} doesn't look like a Minecraft world directory "
+                f"(no level.dat and no region/ subdirectory). If you meant "
+                f"to ingest backup archives, use `chunkvault ingest` instead. "
+                f"If this really IS your world, point at the directory that "
+                f"contains level.dat (often <server>/world/)."
+            )
+
         ts = (timestamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
         ts_ms = int(ts.timestamp() * 1000)
 
@@ -1118,6 +1131,28 @@ def _walk_world_files(world: Path) -> Iterator[Path]:
     for entry in world.rglob("*"):
         if entry.is_file():
             yield entry
+
+
+def _looks_like_mc_world(world: Path) -> bool:
+    """Cheap sanity check: real MC worlds have level.dat OR a region/ subdir.
+
+    Used by snapshot() to refuse running on obviously-wrong inputs (the
+    archive folder, the vault itself, /home, etc.) before ingesting 84 GB
+    of irrelevant files.
+    """
+    if (world / "level.dat").is_file():
+        return True
+    # Vanilla overworld
+    if (world / "region").is_dir():
+        return True
+    # Any DIM-* folder counts (some servers don't have an overworld)
+    for entry in world.iterdir() if world.is_dir() else ():
+        if entry.is_dir() and entry.name.startswith("DIM") \
+                and (entry / "region").is_dir():
+            return True
+        if entry.name == "dimensions" and entry.is_dir():
+            return True
+    return False
 
 
 def _manifest_chunk_map(manifest: Manifest) -> dict[tuple, bytes]:
