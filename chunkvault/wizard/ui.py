@@ -21,6 +21,8 @@ import questionary
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
+
+from .i18n import t
 from rich.progress import (
     BarColumn,
     Progress,
@@ -252,108 +254,80 @@ def select_archives(
 
 # ---- prompts --------------------------------------------------------------
 
-_MENU_CHOICES = [
-    questionary.Choice(
-        "Ingest archives      │ bulk-import .zip/.tar.gz backup files",
-        value="i"),
-    questionary.Choice(
-        "Snapshot a world     │ live MC server's world/ directory",
-        value="s"),
-    questionary.Choice(
-        "List snapshots       │ show what's in the vault",
-        value="l"),
-    questionary.Choice(
-        "Restore a snapshot   │ reassemble a snapshot back to disk",
-        value="x"),
-    questionary.Choice(
-        "Delete a snapshot    │ remove (refs decremented, gc to reclaim)",
-        value="D"),
-    questionary.Choice(
-        "Diff snapshots       │ compare any two snapshots in the vault",
-        value="d"),
-    questionary.Choice(
-        "Browse vault (web)   │ Leaflet-based map browser",
-        value="b"),
-    questionary.Choice(
-        "Render thumbnails    │ tile renderer for one or all snapshots",
-        value="t"),
-    questionary.Choice(
-        "Logs subsystem       │ list / extract / delete log snapshots",
-        value="L"),
-    questionary.Choice(
-        "Verify integrity     │ rehash every blob, detect bit-rot",
-        value="v"),
-    questionary.Choice(
-        "Verify round-trip    │ snapshot vs. original tree byte-compare",
-        value="V"),
-    questionary.Choice(
-        "Verify two folders   │ compare two arbitrary directory trees",
-        value="F"),
-    questionary.Choice(
-        "Fsck (repair)        │ clean up after Ctrl-C / kill / power-loss",
-        value="f"),
-    questionary.Choice(
-        "Repair timestamps    │ align ts/labels with level.dat + dedup",
-        value="r"),
-    questionary.Choice(
-        "Retime a snapshot    │ change one snapshot's timeline ts",
-        value="R"),
-    questionary.Choice(
-        "Garbage-collect      │ reclaim space from deleted snapshots",
-        value="g"),
-    questionary.Choice(
-        "Quit",
-        value="q"),
-]
+def _menu_choice(label_key: str, hint_key: str | None, value: str):
+    """Build a questionary.Choice with the localized label+hint at call time.
+
+    Built fresh per ``main_menu`` invocation so a runtime ``set_locale``
+    is reflected on the very next menu display, not only after restart.
+    """
+    label = t(label_key)
+    if hint_key is not None:
+        # Pad to a fixed visual column so the hint pipe lines up across rows.
+        # (Kept tight at 18 chars — Chinese glyphs are wider than ASCII so
+        # widths won't perfectly line up, but it stays readable either way.)
+        label = f"{label:<18}│ {t(hint_key)}"
+    return questionary.Choice(label, value=value)
+
+
+def _build_menu_choices() -> list:
+    return [
+        _menu_choice("menu.ingest",       "menu.ingest.hint",     "i"),
+        _menu_choice("menu.snapshot",     "menu.snapshot.hint",   "s"),
+        _menu_choice("menu.list",         "menu.list.hint",       "l"),
+        _menu_choice("menu.restore",      "menu.restore.hint",    "x"),
+        _menu_choice("menu.delete",       "menu.delete.hint",     "D"),
+        _menu_choice("menu.diff",         "menu.diff.hint",       "d"),
+        _menu_choice("menu.browse",       "menu.browse.hint",     "b"),
+        _menu_choice("menu.thumbnail",    "menu.thumbnail.hint",  "t"),
+        _menu_choice("menu.logs",         "menu.logs.hint",       "L"),
+        _menu_choice("menu.verify",       "menu.verify.hint",     "v"),
+        _menu_choice("menu.verify_rt",    "menu.verify_rt.hint",  "V"),
+        _menu_choice("menu.verify_dirs",  "menu.verify_dirs.hint","F"),
+        _menu_choice("menu.fsck",         "menu.fsck.hint",       "f"),
+        _menu_choice("menu.repair_ts",    "menu.repair_ts.hint",  "r"),
+        _menu_choice("menu.retime",       "menu.retime.hint",     "R"),
+        _menu_choice("menu.gc",           "menu.gc.hint",         "g"),
+        _menu_choice("menu.lang",         "menu.lang.hint",       "@"),
+        _menu_choice("menu.quit",         None,                   "q"),
+    ]
 
 
 def render_menu_guide(console: Console) -> None:
     """Show a guide panel BEFORE the menu so the user knows what each
-    operation expects as input."""
-    console.print(Panel.fit(
-        "[bold]── snapshots ──[/bold]\n"
-        "[bold cyan]Ingest archives[/bold cyan] — bulk-import a folder of "
-        "backup zips. Detects servers, dedupes against the existing pool.\n"
-        "[bold cyan]Snapshot a world[/bold cyan] — capture a single live MC "
-        "world directory (the one with [yellow]level.dat[/yellow]).\n"
-        "[bold cyan]List snapshots[/bold cyan] — show what's in the vault.\n"
-        "[bold cyan]Restore[/bold cyan] — reassemble any snapshot back to a "
-        "directory on disk.\n"
-        "[bold cyan]Delete[/bold cyan] — remove a snapshot. Chunks become "
-        "eligible for garbage-collect.\n"
+    operation expects as input. Section headers + per-op short labels
+    come from the active locale's string table; the rest is built
+    dynamically from menu hints (which are themselves localized)."""
+    def _line(menu_key: str) -> str:
+        return f"[bold cyan]{t(menu_key)}[/bold cyan] — {t(menu_key + '.hint')}"
+
+    body = (
+        f"[bold]{t('guide.section.snapshots')}[/bold]\n"
+        f"{_line('menu.ingest')}\n"
+        f"{_line('menu.snapshot')}\n"
+        f"{_line('menu.list')}\n"
+        f"{_line('menu.restore')}\n"
+        f"{_line('menu.delete')}\n"
         "\n"
-        "[bold]── compare / visualize ──[/bold]\n"
-        "[bold cyan]Diff snapshots[/bold cyan] — compare any two snapshots "
-        "from manifests.\n"
-        "[bold cyan]Browse vault[/bold cyan] — local web UI with map browser.\n"
-        "[bold cyan]Render thumbnails[/bold cyan] — backfill the per-chunk "
-        "tiles used by browse + diff.\n"
+        f"[bold]{t('guide.section.compare')}[/bold]\n"
+        f"{_line('menu.diff')}\n"
+        f"{_line('menu.browse')}\n"
+        f"{_line('menu.thumbnail')}\n"
         "\n"
-        "[bold]── logs ──[/bold]\n"
-        "[bold cyan]Logs subsystem[/bold cyan] — list / extract / delete the "
-        "log snapshots captured during ingest.\n"
+        f"[bold]{t('guide.section.logs')}[/bold]\n"
+        f"{_line('menu.logs')}\n"
         "\n"
-        "[bold]── integrity ──[/bold]\n"
-        "[bold cyan]Verify integrity[/bold cyan] — rehash every blob; catches "
-        "bit-rot.\n"
-        "[bold cyan]Verify round-trip[/bold cyan] — restore a snapshot and "
-        "byte-compare against an original world tree.\n"
-        "[bold cyan]Verify two folders[/bold cyan] — compare any two "
-        "directory trees (handy for spot-checking restored vs. extracted).\n"
+        f"[bold]{t('guide.section.integrity')}[/bold]\n"
+        f"{_line('menu.verify')}\n"
+        f"{_line('menu.verify_rt')}\n"
+        f"{_line('menu.verify_dirs')}\n"
         "\n"
-        "[bold]── repair ──[/bold]\n"
-        "[bold cyan]Fsck[/bold cyan] — fixes half-written state from "
-        "Ctrl-C / kill / power-loss.\n"
-        "[bold cyan]Repair timestamps[/bold cyan] — aligns every snapshot's "
-        "ts and label with its level.dat LastPlayed; dedupes duplicates from "
-        "the historical fallback-to-now() bug.\n"
-        "[bold cyan]Retime a snapshot[/bold cyan] — change one snapshot's "
-        "timeline ts (auto from level.dat or explicit).\n"
-        "[bold cyan]Garbage-collect[/bold cyan] — reclaim disk space after "
-        "`delete`.",
-        title="What each operation does",
-        border_style="cyan",
-    ))
+        f"[bold]{t('guide.section.repair')}[/bold]\n"
+        f"{_line('menu.fsck')}\n"
+        f"{_line('menu.repair_ts')}\n"
+        f"{_line('menu.retime')}\n"
+        f"{_line('menu.gc')}"
+    )
+    console.print(Panel.fit(body, title=t("guide.title"), border_style="cyan"))
 
 
 def main_menu(console: Console, *, with_guide: bool = True) -> str:
@@ -361,15 +335,19 @@ def main_menu(console: Console, *, with_guide: bool = True) -> str:
 
     When ``with_guide`` is True (default), prints a guidance panel above
     the menu describing what each operation does + what input it expects.
+
+    Choices are rebuilt every call so a runtime ``set_locale`` reflects on
+    the very next display.
     """
     if with_guide:
         render_menu_guide(console)
+    choices = _build_menu_choices()
     answer = questionary.select(
-        "What would you like to do?",
-        choices=_MENU_CHOICES,
-        default=_MENU_CHOICES[0],
+        t("prompt.what_to_do"),
+        choices=choices,
+        default=choices[0],
         style=_QSTYLE,
-        instruction="(↑↓ to move, Enter to select)",
+        instruction=t("prompt.menu_keys"),
     ).ask()
     if answer is None:
         return "q"

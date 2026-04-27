@@ -85,13 +85,11 @@ def _make_phase_cb(progress, task_id, prefix: str):
 
 def run_wizard(console: Console | None = None) -> int:
     """Top-level entry point. Returns the process exit code."""
+    from .i18n import t as _t
     console = console or make_console()
-    console.print("[bold magenta]chunkvault[/bold magenta] interactive wizard")
+    console.print(f"[bold magenta]{_t('wizard.title')}[/bold magenta]")
     cwd = Path.cwd()
-    console.print(
-        f"[dim]scanning {cwd} (depth ≤ 3, skipping system dirs) "
-        f"for repos and archives…[/dim]"
-    )
+    console.print(f"[dim]{_t('wizard.detecting')} ({cwd})[/dim]")
 
     env = detect_environment()
     render_environment(console, env)
@@ -107,7 +105,7 @@ def run_wizard(console: Console | None = None) -> int:
         choice = main_menu(console, with_guide=first_loop)
         first_loop = False
         if choice == "q":
-            console.print("[dim]bye.[/dim]")
+            console.print(f"[dim]{_t('prompt.bye')}[/dim]")
             return 0
         try:
             if choice == "i":
@@ -142,10 +140,12 @@ def run_wizard(console: Console | None = None) -> int:
                 run_retime_flow(console, env)
             elif choice == "g":
                 run_gc_flow(console, env)
+            elif choice == "@":
+                run_language_flow(console, env)
         except KeyboardInterrupt:
-            console.print("\n[yellow]cancelled.[/yellow]")
+            console.print(f"\n[yellow]{_t('prompt.cancel')}[/yellow]")
         except Exception as e:
-            console.print(f"[red]error:[/red] {e}")
+            console.print(f"[red]{_t('prompt.error')}[/red] {e}")
         env = detect_environment()
 
 
@@ -959,3 +959,39 @@ def run_logs_flow(console: Console, env: EnvironmentSummary):
             return
         repo.delete_log_snapshot(snap)
         console.print(f"[green]deleted log snapshot[/green] {snap.short_id}")
+
+
+def run_language_flow(console: Console, env: EnvironmentSummary):
+    """Pick a UI language. Persists to ~/.chunkvault/config.json."""
+    from . import i18n
+
+    current = i18n.get_locale_info(i18n.get_locale())
+    current_label = current.native_name if current else i18n.get_locale()
+    console.print(i18n.t("lang.current", locale=current_label))
+
+    locales = i18n.list_locales()
+    options: list[str] = []
+    for L in locales:
+        marker = " *" if L.tag == i18n.get_locale() else ""
+        review = " [yellow](review needed)[/yellow]" if L.review_needed else ""
+        # rich markup is preserved when questionary prints back, but the
+        # selection value matches the visible label string.
+        # Strip markup for the picker; we only use it for status hints.
+        pretty = f"{L.native_name}  [{L.tag}]{marker}"
+        options.append(pretty)
+
+    pick = choose_one(console, i18n.t("lang.choose"), options)
+    if pick is None:
+        return
+    idx = options.index(pick)
+    chosen = locales[idx]
+    saved_path = i18n.set_locale(chosen.tag)
+    if saved_path is None:
+        console.print(
+            f"[yellow]language switched to {chosen.native_name} for this "
+            f"session, but could not write the config file.[/yellow]"
+        )
+    else:
+        console.print(i18n.t(
+            "lang.changed", locale=chosen.native_name, path=saved_path,
+        ))

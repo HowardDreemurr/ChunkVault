@@ -1,5 +1,7 @@
 # chunkvault
 
+**English** | [中文](README.zh-CN.md)
+
 > **Chunk-level incremental backup for Minecraft Java worlds.**
 > A library, not a mod, for keeping years of historical snapshots without your repo growing linearly with snapshot count.
 
