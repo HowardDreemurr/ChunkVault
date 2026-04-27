@@ -254,25 +254,52 @@ def select_archives(
 
 _MENU_CHOICES = [
     questionary.Choice(
-        "Ingest archives    │ for bulk-importing .zip/.tar.gz backup files",
+        "Ingest archives      │ bulk-import .zip/.tar.gz backup files",
         value="i"),
     questionary.Choice(
-        "Snapshot a world   │ for a live MC server's world/ directory",
+        "Snapshot a world     │ live MC server's world/ directory",
         value="s"),
     questionary.Choice(
-        "Diff snapshots     │ compare any two snapshots already in the vault",
-        value="d"),
-    questionary.Choice(
-        "List snapshots     │ show what's in the vault",
+        "List snapshots       │ show what's in the vault",
         value="l"),
     questionary.Choice(
-        "Verify integrity   │ rehash every blob, detect bit-rot",
+        "Restore a snapshot   │ reassemble a snapshot back to disk",
+        value="x"),
+    questionary.Choice(
+        "Delete a snapshot    │ remove (refs decremented, gc to reclaim)",
+        value="D"),
+    questionary.Choice(
+        "Diff snapshots       │ compare any two snapshots in the vault",
+        value="d"),
+    questionary.Choice(
+        "Browse vault (web)   │ Leaflet-based map browser",
+        value="b"),
+    questionary.Choice(
+        "Render thumbnails    │ tile renderer for one or all snapshots",
+        value="t"),
+    questionary.Choice(
+        "Logs subsystem       │ list / extract / delete log snapshots",
+        value="L"),
+    questionary.Choice(
+        "Verify integrity     │ rehash every blob, detect bit-rot",
         value="v"),
     questionary.Choice(
-        "Fsck (repair)      │ clean up after Ctrl-C / kill / power-loss",
+        "Verify round-trip    │ snapshot vs. original tree byte-compare",
+        value="V"),
+    questionary.Choice(
+        "Verify two folders   │ compare two arbitrary directory trees",
+        value="F"),
+    questionary.Choice(
+        "Fsck (repair)        │ clean up after Ctrl-C / kill / power-loss",
         value="f"),
     questionary.Choice(
-        "Garbage-collect    │ reclaim space from deleted snapshots",
+        "Repair timestamps    │ align ts/labels with level.dat + dedup",
+        value="r"),
+    questionary.Choice(
+        "Retime a snapshot    │ change one snapshot's timeline ts",
+        value="R"),
+    questionary.Choice(
+        "Garbage-collect      │ reclaim space from deleted snapshots",
         value="g"),
     questionary.Choice(
         "Quit",
@@ -284,27 +311,46 @@ def render_menu_guide(console: Console) -> None:
     """Show a guide panel BEFORE the menu so the user knows what each
     operation expects as input."""
     console.print(Panel.fit(
-        "[bold cyan]Ingest archives[/bold cyan] — pick this for "
-        "[bold]a folder of backup .zip files[/bold] (e.g. `D:\\day_backups\\`).\n"
-        "    The wizard finds every archive, peeks inside each one, shows you\n"
-        "    what servers + worlds + logs it found, then asks confirm.\n"
+        "[bold]── snapshots ──[/bold]\n"
+        "[bold cyan]Ingest archives[/bold cyan] — bulk-import a folder of "
+        "backup zips. Detects servers, dedupes against the existing pool.\n"
+        "[bold cyan]Snapshot a world[/bold cyan] — capture a single live MC "
+        "world directory (the one with [yellow]level.dat[/yellow]).\n"
+        "[bold cyan]List snapshots[/bold cyan] — show what's in the vault.\n"
+        "[bold cyan]Restore[/bold cyan] — reassemble any snapshot back to a "
+        "directory on disk.\n"
+        "[bold cyan]Delete[/bold cyan] — remove a snapshot. Chunks become "
+        "eligible for garbage-collect.\n"
         "\n"
-        "[bold cyan]Snapshot a world[/bold cyan] — pick this for "
-        "[bold]a single live MC world directory[/bold]\n"
-        "    (the one containing [yellow]level.dat[/yellow] and "
-        "[yellow]region/[/yellow], e.g. `D:\\server\\world\\`).\n"
-        "    Don't point this at the server root — point at the "
-        "[bold]world/[/bold] subdir.\n"
-        "\n"
+        "[bold]── compare / visualize ──[/bold]\n"
         "[bold cyan]Diff snapshots[/bold cyan] — compare any two snapshots "
-        "you already took.\n"
-        "[bold cyan]List snapshots[/bold cyan] — see everything currently in the vault.\n"
-        "[bold cyan]Verify integrity[/bold cyan] — rehash every blob; "
-        "catches disk bit-rot.\n"
-        "[bold cyan]Fsck (repair)[/bold cyan] — fixes half-written state from "
-        "Ctrl-C / kill.\n"
-        "[bold cyan]Garbage-collect[/bold cyan] — reclaims disk space "
-        "after `delete`.",
+        "from manifests.\n"
+        "[bold cyan]Browse vault[/bold cyan] — local web UI with map browser.\n"
+        "[bold cyan]Render thumbnails[/bold cyan] — backfill the per-chunk "
+        "tiles used by browse + diff.\n"
+        "\n"
+        "[bold]── logs ──[/bold]\n"
+        "[bold cyan]Logs subsystem[/bold cyan] — list / extract / delete the "
+        "log snapshots captured during ingest.\n"
+        "\n"
+        "[bold]── integrity ──[/bold]\n"
+        "[bold cyan]Verify integrity[/bold cyan] — rehash every blob; catches "
+        "bit-rot.\n"
+        "[bold cyan]Verify round-trip[/bold cyan] — restore a snapshot and "
+        "byte-compare against an original world tree.\n"
+        "[bold cyan]Verify two folders[/bold cyan] — compare any two "
+        "directory trees (handy for spot-checking restored vs. extracted).\n"
+        "\n"
+        "[bold]── repair ──[/bold]\n"
+        "[bold cyan]Fsck[/bold cyan] — fixes half-written state from "
+        "Ctrl-C / kill / power-loss.\n"
+        "[bold cyan]Repair timestamps[/bold cyan] — aligns every snapshot's "
+        "ts and label with its level.dat LastPlayed; dedupes duplicates from "
+        "the historical fallback-to-now() bug.\n"
+        "[bold cyan]Retime a snapshot[/bold cyan] — change one snapshot's "
+        "timeline ts (auto from level.dat or explicit).\n"
+        "[bold cyan]Garbage-collect[/bold cyan] — reclaim disk space after "
+        "`delete`.",
         title="What each operation does",
         border_style="cyan",
     ))

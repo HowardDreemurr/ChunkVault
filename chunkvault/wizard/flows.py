@@ -20,6 +20,7 @@ from ..store import (
 from ..store.ingest import IngestResult
 from .detect import EnvironmentSummary, detect_environment, summarize_repo
 from .ui import (
+    choose_one,
     confirm,
     fmt_bytes,
     main_menu,
@@ -113,14 +114,32 @@ def run_wizard(console: Console | None = None) -> int:
                 run_ingest_flow(console, env)
             elif choice == "s":
                 run_snapshot_flow(console, env)
-            elif choice == "d":
-                run_diff_flow(console, env)
             elif choice == "l":
                 run_list_flow(console, env)
+            elif choice == "x":
+                run_restore_flow(console, env)
+            elif choice == "D":
+                run_delete_flow(console, env)
+            elif choice == "d":
+                run_diff_flow(console, env)
+            elif choice == "b":
+                run_browse_flow(console, env)
+            elif choice == "t":
+                run_thumbnail_flow(console, env)
+            elif choice == "L":
+                run_logs_flow(console, env)
             elif choice == "v":
                 run_verify_flow(console, env)
+            elif choice == "V":
+                run_verify_roundtrip_flow(console, env)
+            elif choice == "F":
+                run_verify_folders_flow(console, env)
             elif choice == "f":
                 run_fsck_flow(console, env)
+            elif choice == "r":
+                run_repair_timestamps_flow(console, env)
+            elif choice == "R":
+                run_retime_flow(console, env)
             elif choice == "g":
                 run_gc_flow(console, env)
         except KeyboardInterrupt:
@@ -131,6 +150,52 @@ def run_wizard(console: Console | None = None) -> int:
 
 
 # ---- repo helper ----------------------------------------------------------
+
+def _pick_snapshot(
+    console: Console, repo: ChunkSnapshotRepo, *,
+    prompt: str = "Pick a snapshot",
+):
+    """Show all snapshots in the vault and let the user pick one.
+
+    Returns the ChunkSnapshot, or None if the vault is empty / user
+    cancelled. The displayed labels are short (id-prefix + ts + label)
+    so even a long list scrolls cleanly in the questionary picker.
+    """
+    snaps = repo.list()
+    if not snaps:
+        console.print("[yellow]vault has no snapshots yet.[/yellow]")
+        return None
+    options = [
+        f"{s.short_id}  {s.timestamp.isoformat()}  {(s.label or '-')[:40]}"
+        for s in snaps
+    ]
+    pick = choose_one(console, prompt, options)
+    if pick is None:
+        return None
+    idx = options.index(pick)
+    return snaps[idx]
+
+
+def _pick_log_snapshot(
+    console: Console, repo: ChunkSnapshotRepo, *,
+    prompt: str = "Pick a log snapshot",
+):
+    """Same as :func:`_pick_snapshot` but for log snapshots."""
+    snaps = repo.list_log_snapshots()
+    if not snaps:
+        console.print("[yellow]vault has no log snapshots.[/yellow]")
+        return None
+    options = [
+        f"{s.short_id}  {s.timestamp.isoformat()}  {(s.label or '-'):26}  "
+        f"servers={s.server_count} files={s.file_count}"
+        for s in snaps
+    ]
+    pick = choose_one(console, prompt, options)
+    if pick is None:
+        return None
+    idx = options.index(pick)
+    return snaps[idx]
+
 
 def _pick_or_create_repo(console: Console, env: EnvironmentSummary) -> ChunkSnapshotRepo:
     chunk_repos = [r for r in env.repos if r.kind == "chunk"]
@@ -503,3 +568,394 @@ def run_fsck_flow(console: Console, env: EnvironmentSummary):
         console.print(f"  dangling row: {snap_id}")
     for path in report.stray_temp_files[:10]:
         console.print(f"  stray .tmp file: {path}")
+
+
+def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
+    """Vault-wide timestamp/label realignment + dedup using level.dat as the
+    authoritative source. Two-stage: dry-run report → confirm → apply."""
+    from datetime import datetime, timezone
+
+    render_op_intro(
+        console, "Repair timestamps",
+        "Align every snapshot's timestamp + label with its manifest's "
+        "level.dat LastPlayed (the authoritative save time). Detects and "
+        "dedupes snapshots created by the historical fallback-to-now() "
+        "ingest bug. Always shows a dry-run plan first; you confirm "
+        "before anything is modified.",
+        expects="Just the vault path.",
+    )
+    repo = _pick_or_create_repo(console, env)
+
+    console.print("[dim]scanning vault…[/dim]")
+    dry = repo.repair_timestamps(dry_run=True)
+    console.print(f"[bold]{dry.summary()}[/bold]")
+
+    if dry.no_last_played:
+        console.print(
+            f"[yellow]{len(dry.no_last_played)} snapshot(s) lack LastPlayed "
+            f"in their manifest — these can NOT be auto-repaired and will "
+            f"be left alone:[/yellow]"
+        )
+        for sid, label in dry.no_last_played[:10]:
+            console.print(f"  {sid[:12]}  {label or '-'}")
+        if len(dry.no_last_played) > 10:
+            console.print(f"  ... ({len(dry.no_last_played) - 10} more)")
+
+    if dry.unreadable:
+        console.print(
+            f"[red]{len(dry.unreadable)} manifest(s) unreadable:[/red]"
+        )
+        for sid, err in dry.unreadable[:5]:
+            console.print(f"  {sid[:12]}: {err}")
+
+    if dry.duplicate_groups:
+        console.print(
+            f"\n[bold]{len(dry.duplicate_groups)} duplicate group(s)[/bold] "
+            f"(snapshots that should collapse into one):"
+        )
+        for g in dry.duplicate_groups[:10]:
+            ts_iso = datetime.fromtimestamp(
+                g.target_ts_ms / 1000, tz=timezone.utc,
+            ).isoformat()
+            console.print(f"  [cyan]{g.world_name}[/cyan] @ {ts_iso}")
+            console.print(f"    keep:   {g.winner_id[:12]}")
+            for lid in g.loser_ids:
+                console.print(f"    delete: {lid[:12]}")
+        if len(dry.duplicate_groups) > 10:
+            console.print(
+                f"  ... ({len(dry.duplicate_groups) - 10} more groups)"
+            )
+
+    if dry.to_retime:
+        console.print(
+            f"\n[bold]{len(dry.to_retime)} snapshot(s) will be retimed[/bold] "
+            f"(showing first 10):"
+        )
+        for plan in dry.to_retime[:10]:
+            old_iso = datetime.fromtimestamp(
+                plan.old_ts_ms / 1000, tz=timezone.utc,
+            ).isoformat()
+            new_iso = datetime.fromtimestamp(
+                plan.new_ts_ms / 1000, tz=timezone.utc,
+            ).isoformat()
+            label_part = (
+                f"  [dim]label: {plan.old_label!r} → {plan.new_label!r}[/dim]"
+                if plan.new_label != plan.old_label else ""
+            )
+            console.print(f"  {plan.snap_id[:12]}  {old_iso} → {new_iso}{label_part}")
+        if len(dry.to_retime) > 10:
+            console.print(f"  ... ({len(dry.to_retime) - 10} more)")
+
+    if not (dry.to_retime or dry.to_delete):
+        console.print("[green]vault is clean — nothing to do.[/green]")
+        return
+
+    console.print()
+    console.print(
+        "[yellow bold]This will modify the vault.[/yellow bold] "
+        "Duplicates will be deleted; survivors retimed. The chunk pool "
+        "is content-addressed so no chunk data is lost — only stale "
+        "manifest+index rows."
+    )
+    if not confirm(console, "Apply the plan above?", default=False):
+        console.print("[dim]cancelled — vault unchanged.[/dim]")
+        return
+
+    result = repo.repair_timestamps(dry_run=False)
+    console.print(f"[green]{result.summary()}[/green]")
+    if result.errors:
+        console.print(
+            f"[red]{len(result.errors)} error(s) during apply:[/red]"
+        )
+        for op, sid, msg in result.errors[:10]:
+            console.print(f"  [{op}] {sid[:12]}: {msg}")
+
+
+def run_restore_flow(console: Console, env: EnvironmentSummary):
+    """Materialize a snapshot back to a directory on disk."""
+    render_op_intro(
+        console, "Restore a snapshot",
+        "Pick a snapshot and reassemble its world tree to a destination "
+        "directory. Optionally restore only specific files (by manifest "
+        "relative path). The chunk pool is read-only — restore never "
+        "alters vault state.",
+        expects="The vault path, a snapshot to restore, and a destination dir.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    snap = _pick_snapshot(console, repo, prompt="Snapshot to restore")
+    if snap is None:
+        return
+    dest = prompt_path(console, "Destination directory", default=Path.cwd() / "restored")
+    if dest.exists() and any(dest.iterdir()):
+        if not confirm(
+            console, f"{dest} is not empty — write into it anyway?",
+            default=False,
+        ):
+            console.print("[dim]cancelled.[/dim]")
+            return
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("restore", total=None)
+        cb = _make_phase_cb(progress, task, prefix="phase")
+        repo.restore(snap, dest, progress_cb=cb)
+    console.print(f"[green]restored[/green] {snap.short_id} → {dest}")
+
+
+def run_delete_flow(console: Console, env: EnvironmentSummary):
+    """Remove a snapshot from the vault. Chunks become eligible for gc."""
+    render_op_intro(
+        console, "Delete a snapshot",
+        "Removes the snapshot's index row + manifest. Referenced chunks "
+        "have their ref counts decremented; chunks no longer referenced "
+        "by anything become eligible for garbage-collect (run gc to "
+        "actually reclaim their disk space).",
+        expects="The vault path and the snapshot to remove.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    snap = _pick_snapshot(console, repo, prompt="Snapshot to delete")
+    if snap is None:
+        return
+    if not confirm(
+        console,
+        f"DELETE snapshot {snap.short_id} ({snap.label or '-'})? This "
+        f"cannot be undone (but the chunk pool is content-addressed, so "
+        f"the same content can be re-ingested without data loss).",
+        default=False,
+    ):
+        console.print("[dim]cancelled.[/dim]")
+        return
+    repo.delete(snap)
+    console.print(f"[green]deleted[/green] {snap.short_id}")
+
+
+def run_retime_flow(console: Console, env: EnvironmentSummary):
+    """Reassign one snapshot's timeline timestamp."""
+    render_op_intro(
+        console, "Retime a snapshot",
+        "Reassign one snapshot's timeline timestamp. Either re-derive it "
+        "from the manifest's level.dat LastPlayed (recommended), or pass "
+        "an explicit ISO8601 datetime. The original timestamp is "
+        "preserved as an audit field. For vault-wide repair, use "
+        "[bold]Repair timestamps[/bold] instead.",
+        expects="The vault, a snapshot, and either nothing (auto) or a new ts.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    snap = _pick_snapshot(console, repo, prompt="Snapshot to retime")
+    if snap is None:
+        return
+    use_level_dat = confirm(
+        console, "Re-derive ts from manifest's level.dat LastPlayed?",
+        default=True,
+    )
+    if use_level_dat:
+        updated, source = repo.retime_snapshot_from_manifest(snap)
+        if source == "no_last_played":
+            console.print(
+                f"[yellow]manifest has no LastPlayed — snapshot unchanged.[/yellow]"
+            )
+            return
+        console.print(
+            f"[green]retimed[/green] {updated.short_id} → "
+            f"{updated.timestamp.isoformat()} [from level.dat]"
+        )
+        return
+    raw = prompt_path(
+        console, "New timestamp (ISO8601, e.g. 2024-06-15T10:30:00)",
+        default=Path(snap.timestamp.isoformat()),
+    )
+    try:
+        new_ts = datetime.fromisoformat(str(raw))
+    except ValueError as e:
+        console.print(f"[red]invalid timestamp: {e}[/red]")
+        return
+    if new_ts.tzinfo is None:
+        new_ts = new_ts.replace(tzinfo=timezone.utc)
+    updated = repo.retime_snapshot(snap, new_ts)
+    console.print(
+        f"[green]retimed[/green] {updated.short_id} → {updated.timestamp.isoformat()}"
+    )
+
+
+def run_thumbnail_flow(console: Console, env: EnvironmentSummary):
+    """Render thumbnail tiles for one snapshot or all snapshots."""
+    render_op_intro(
+        console, "Render thumbnails",
+        "Render or backfill the small per-chunk PNG tiles used by the "
+        "browser and diff visualization. Idempotent — already-rendered "
+        "tiles are skipped via cache hit.",
+        expects="The vault and either one snapshot or 'all snapshots'.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    do_all = confirm(console, "Render thumbnails for ALL snapshots?", default=False)
+    from ..viz.snapshot_render import (
+        ensure_tiles_for_manifest, write_snapshot_sidecars,
+    )
+    from ..store.manifest import read_manifest
+
+    targets = repo.list() if do_all else [
+        s for s in [_pick_snapshot(console, repo, prompt="Snapshot")] if s is not None
+    ]
+    if not targets:
+        return
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("render", total=None)
+        cb = _make_phase_cb(progress, task, prefix="phase")
+        for snap in targets:
+            manifest = read_manifest(snap.manifest_path)
+            ensure_tiles_for_manifest(repo, manifest, progress_cb=cb)
+            write_snapshot_sidecars(repo, snap.id, manifest, progress_cb=cb)
+    console.print(f"[green]done[/green] — processed {len(targets)} snapshot(s)")
+
+
+def run_browse_flow(console: Console, env: EnvironmentSummary):
+    """Start the local Leaflet browser for the vault."""
+    render_op_intro(
+        console, "Browse vault",
+        "Spin up a local HTTP server with a Leaflet-based map browser "
+        "for the vault. Open the printed URL in your browser. Press "
+        "Ctrl-C in this terminal to stop the server.",
+        expects="The vault path. Optional: bind host + port.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    host = "127.0.0.1"
+    port = 8765
+    if confirm(console, f"Bind to {host}:{port}?", default=True):
+        pass
+    else:
+        raw_host = prompt_path(console, "Host (use 0.0.0.0 to expose on LAN)",
+                               default=Path(host))
+        host = str(raw_host)
+        raw_port = prompt_path(console, "Port", default=Path(str(port)))
+        try:
+            port = int(str(raw_port))
+        except ValueError:
+            console.print("[red]invalid port — falling back to 8765[/red]")
+            port = 8765
+    from ..viz.browser import serve
+    try:
+        serve(repo.repo_path, host=host, port=port)
+    except KeyboardInterrupt:
+        console.print("\n[dim]server stopped.[/dim]")
+
+
+def run_verify_roundtrip_flow(console: Console, env: EnvironmentSummary):
+    """Compare a snapshot against a known-good source tree byte-for-byte."""
+    render_op_intro(
+        console, "Verify round-trip",
+        "Restore a snapshot to a temp dir and compare against a known-"
+        "good source tree (the original world or extracted archive). "
+        "The snapshot passes only if every chunk + every file matches "
+        "byte-for-byte.",
+        expects="The vault, a snapshot, and the path to a source world dir.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    snap = _pick_snapshot(console, repo, prompt="Snapshot to verify")
+    if snap is None:
+        return
+    source = prompt_path(console, "Original world directory", default=Path.cwd())
+    from ..store.roundtrip import verify_roundtrip
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("verify", total=None)
+        cb = _make_phase_cb(progress, task, prefix="phase")
+        report = verify_roundtrip(repo, snap, source, progress_cb=cb)
+    color = "green" if report.passed else "red"
+    console.print(f"[{color}]{report.summary()}[/{color}]")
+
+
+def run_verify_folders_flow(console: Console, env: EnvironmentSummary):
+    """Compare two arbitrary directory trees byte-for-byte."""
+    render_op_intro(
+        console, "Verify two folders",
+        "Compare two directory trees (e.g. a restored snapshot vs a "
+        "manually extracted archive) chunk-by-chunk for region files "
+        "and byte-by-byte for everything else. No vault required.",
+        expects="Two directory paths. Optional: a path for a written report.",
+    )
+    a = prompt_path(console, "Left directory (treat as source)", default=Path.cwd())
+    b = prompt_path(console, "Right directory (treat as restore)", default=Path.cwd())
+    write_report = confirm(
+        console, "Write a detailed text report to file?", default=False,
+    )
+    report_path = None
+    if write_report:
+        report_path = prompt_path(
+            console, "Report path",
+            default=Path.cwd() / "verify-folders-report.txt",
+        )
+    from ..store.roundtrip import compare_directories
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("compare", total=None)
+        cb = _make_phase_cb(progress, task, prefix="phase")
+        report = compare_directories(a, b, progress_cb=cb)
+    color = "green" if report.passed else "red"
+    console.print(f"[{color}]{report.summary()}[/{color}]")
+    if report_path is not None:
+        from ..cli import _write_verify_folders_report
+        _write_verify_folders_report(report_path, a, b, report)
+        console.print(f"[dim]detailed report: {report_path}[/dim]")
+
+
+def run_logs_flow(console: Console, env: EnvironmentSummary):
+    """Sub-menu for the parallel log-snapshot subsystem."""
+    render_op_intro(
+        console, "Logs subsystem",
+        "Logs and crash-reports captured during ingest live in a "
+        "parallel deduplicated pool, separate from world snapshots. "
+        "Browse / extract / delete them here without touching world data.",
+        expects="The vault, then an action: list / extract / delete.",
+    )
+    repo = _pick_or_create_repo(console, env)
+    action = choose_one(
+        console, "What to do with logs?",
+        [
+            "list   │ show every log snapshot",
+            "extract │ materialize a log snapshot to a directory",
+            "delete │ remove a log snapshot",
+            "back",
+        ],
+    )
+    if action.startswith("back"):
+        return
+    if action.startswith("list"):
+        snaps = repo.list_log_snapshots()
+        if not snaps:
+            console.print("[yellow](no log snapshots)[/yellow]")
+            return
+        for s in snaps:
+            console.print(
+                f"{s.short_id}  {s.timestamp.isoformat()}  "
+                f"{(s.label or '-'):26}  "
+                f"servers={s.server_count} files={s.file_count}"
+            )
+        return
+    if action.startswith("extract"):
+        snap = _pick_log_snapshot(console, repo, prompt="Log snapshot to extract")
+        if snap is None:
+            return
+        dest = prompt_path(
+            console, "Destination directory",
+            default=Path.cwd() / "logs-extracted",
+        )
+        from ..store.log_manifest import read_log_manifest
+        servers = list(read_log_manifest(snap.manifest_path).servers)
+        wanted: str | None = None
+        if servers and len(servers) > 1:
+            if confirm(console, "Filter to one server only?", default=False):
+                wanted = choose_one(console, "Server", servers)
+        repo.extract_logs(snap, dest, server=wanted)
+        console.print(f"[green]extracted[/green] → {dest}")
+        return
+    if action.startswith("delete"):
+        snap = _pick_log_snapshot(console, repo, prompt="Log snapshot to delete")
+        if snap is None:
+            return
+        if not confirm(
+            console, f"DELETE log snapshot {snap.short_id}?", default=False,
+        ):
+            console.print("[dim]cancelled.[/dim]")
+            return
+        repo.delete_log_snapshot(snap)
+        console.print(f"[green]deleted log snapshot[/green] {snap.short_id}")
