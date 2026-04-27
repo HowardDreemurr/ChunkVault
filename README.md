@@ -1,26 +1,26 @@
 # chunkvault
 
 > **Chunk-level incremental backup for Minecraft Java worlds.**
-> Built for servers with hundreds of historical snapshots that need to fit in a 2 TB SSD.
+> A library, not a mod, for keeping years of historical snapshots without your repo growing linearly with snapshot count.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  100 GB world  ×  100+ snapshots  ─►  ~1 TB on disk         │
-│  cross-version (1.7 → latest)     ─►  preserved per-chunk   │
-│  multi-server zip ingest          ─►  one command            │
+│  many snapshots, modest disk     ─►  chunk-level dedup      │
+│  cross-version                    ─►  preserved per-chunk   │
+│  multi-server archives            ─►  one command           │
 │  chunk-level diff + map viz       ─►  built-in              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-[![tests](https://img.shields.io/badge/tests-464%20passing-brightgreen)]() [![python](https://img.shields.io/badge/python-3.11%2B-blue)]() [![license](https://img.shields.io/badge/license-Apache%202.0-blue)]()
+[![python](https://img.shields.io/badge/python-3.11%2B-blue)]() [![license](https://img.shields.io/badge/license-Apache%202.0-blue)]()
 
 ---
 
 ## The problem
 
-Every existing Minecraft backup tool stores **whole region files**. The trouble is, MC rewrites those files constantly — every chunk-load updates `LastUpdate` fields, the zlib output changes, and tools like git, restic, and rsync see "different bytes → store a new copy". After a year of daily backups your repo is bigger than your hard drive.
+Every existing Minecraft backup tool stores **whole region files**. The trouble is, MC rewrites those files constantly — every chunk-load updates `LastUpdate` fields, the zlib output changes, and tools like git, restic, and rsync see "different bytes → store a new copy". Daily backups stack up linearly even when nothing meaningful changed.
 
-The actual content — the chunks — barely changes. Players cluster around bases; 95% of the world hasn't been touched in months. **chunkvault stores at chunk granularity**, so unchanged chunks never get a second copy. A 100 GB world with 100 historical snapshots collapses to roughly the size of one snapshot plus the actual deltas.
+The actual content — the chunks — barely changes. Most of any explored world isn't touched between sessions. **chunkvault stores at chunk granularity**, so unchanged chunks never get a second copy. The repo grows with the actual deltas, not the snapshot count.
 
 ---
 
@@ -34,7 +34,7 @@ The actual content — the chunks — barely changes. Players cluster around bas
 | **Multi-server zip ingest** | One `chunkvault ingest backup.zip` discovers `EX-Server/`, `CR-Server/`, etc., snapshots each world, captures logs separately. |
 | **Logs handled, not mixed** | Logs/crash-reports go to a parallel deduplicated pool. Browse, extract, or delete independently of world history. |
 | **Interactive wizard** | `chunkvault` with no args drops into a rich-powered TUI: detects your repos and source archives, prompts for config, runs with live progress. |
-| **Chunk-level diff + maps** | Compare any two snapshots in milliseconds (manifest-only). Render PNG heatmaps or self-contained Leaflet HTML overlaid on optional unmined base tiles. |
+| **Chunk-level diff + maps** | Compare any two snapshots from manifests alone — independent of world size. Render PNG heatmaps or self-contained Leaflet HTML overlaid on optional unmined base tiles. |
 | **Verify + gc** | `chunkvault verify` rehashes every blob; `gc` reclaims unreferenced chunks via ref-count fast path (O(deleted), not O(N×M)). |
 | **Two backends** | Default chunk store (recommended) plus a git-backed store inspired by FastBack — for users who want git ergonomics over space efficiency. |
 
@@ -44,9 +44,8 @@ The actual content — the chunks — barely changes. Players cluster around bas
 
 |  | git / FastBack | restic / borg | **chunkvault** |
 |---|---|---|---|
-| Dedup unit | whole region file | content-defined chunks (~1 MB) | **MC chunk** (logical) |
+| Dedup unit | whole region file | generic content-defined chunks | **MC chunk** (logical) |
 | Survives MC's `LastUpdate` churn | ✗ (false positives) | partial | **✓** |
-| 100 GB × 100 snapshots, realistic | 3 – 6 TB | 1 – 2 TB | **0.7 – 1.3 TB** |
 | Cross-version metadata | ✗ | ✗ | **✓** (`mc_version` per snapshot) |
 | Live progress UI | ✗ | partial | **✓** (rich) |
 | Single-file restore | ✓ | ✓ | **✓** |
@@ -267,15 +266,11 @@ chunkvault/
 
 ```
 D:\backup-vault\
-├── chunks/                    ← unique chunk payloads (XX/YY/<hash>)
-│   └── …                      (~1 TB after years of snapshots)
+├── chunks/                    ← unique chunk payloads, content-addressed
 ├── files/                     ← non-region whole files (level.dat, datapacks…)
 ├── logs/                      ← deduplicated log content
-├── manifests/                 ← per-snapshot binary manifests (~50 MB each)
-│   ├── <uuid>.mcbk
-│   └── …
+├── manifests/                 ← per-snapshot binary manifests
 ├── log-snapshots/             ← per-archive JSON log manifests
-│   └── <uuid>.json
 └── index.sqlite               ← snapshot registry + ref counts
 ```
 
@@ -283,62 +278,55 @@ D:\backup-vault\
 
 ## Snapshot lifecycle & crash safety
 
-The chunk-store backend writes "make new state visible **last**." A
-snapshot is invisible to `repo.list()` / `repo.get()` until both its
-manifest is on disk **and** its chunk references have been committed in
-the index. A crash before that point leaves orphan blobs but never a
-half-visible snapshot.
+The core decision behind the chunk-store backend: **make new state visible last**. Content goes into the pool first (durable but unreachable), then the manifest, then a single visibility flip exposes the snapshot. A crash before the flip leaves orphan blobs that gc reclaims; a crash after means the snapshot is committed and complete.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> RegionsPhase: repo.snapshot()
-    RegionsPhase --> FilesPhase: all .mca processed
-    FilesPhase --> ManifestWritten: atomic temp + rename
-    ManifestWritten --> Committed: refs += 1, INSERT snapshots row
-    Committed --> Tiles: render thumbnails
-    Tiles --> Verifying: verify_roundtrip=True
-    Tiles --> [*]: verify_roundtrip=False
-    Verifying --> [*]: report.passed
-    Verifying --> Failed: report.passed == False
+    [*] --> Writing: repo.snapshot()
+    Writing --> Staged: content in pool, manifest on disk
+    Staged --> Committed: visibility flip (atomic)
+    Committed --> Verifying: optional self-check
+    Committed --> [*]: skip self-check
+    Verifying --> [*]: passes
+    Verifying --> Failed: mismatch
+    Failed --> [*]: error raised, snapshot retained
 
-    RegionsPhase: chunks → pool, ref=0
-    FilesPhase: non-region files → pool, ref=0
-    ManifestWritten: .mcbk on disk; still invisible
-    Committed: snapshot visible to list/get/restore
-    Tiles: thumbnails (failures non-fatal, warning only)
-    Verifying: full restore + byte compare
-    Failed: snapshot kept; RoundTripVerificationError raised
+    Writing: hash + dedup chunks and files into the pool
+    Staged: durable on disk, but not yet in the snapshot list
+    Committed: appears in list, refs counted, restorable
+    Verifying: full restore + byte compare against the source
+    Failed: snapshot kept in index so the user can inspect
 ```
 
-| Crash during | On-disk leftovers | Visible? | Cleanup |
+| Crash before | Snapshot visible? | What's left on disk | How to recover |
 |---|---|---|---|
-| `RegionsPhase` / `FilesPhase` | new blobs in `chunks/` and `files/` with `ref_count=0`; possibly `*.tmp.<pid>` from interrupted atomic writes | no | `chunkvault gc` reclaims orphans |
-| Between manifest write and ref commit | `.mcbk` exists in `manifests/` but no `snapshots` row | no | `chunkvault gc` (and `verify --repair`) |
-| `Tiles` | snapshot fully committed; some thumbnails missing | **yes** | `chunkvault thumbnail --all` backfills |
-| `Verifying` | snapshot committed; partial restore in `%TEMP%` | **yes** | report flagged; user inspects, may `delete` |
+| `Staged` | no | unreferenced chunks in the pool | gc reclaims them |
+| `Committed` | no | manifest written but never published | gc reclaims them |
+| `Verifying` | **yes** | snapshot fully committed, thumbnails optional | re-render thumbnails if needed |
+| Verify fails | **yes**, flagged | snapshot present, report attached | inspect; delete if the source was actually corrupted |
 
-**Invariant**: a snapshot in `repo.list()` always has a complete manifest, every referenced chunk on disk, and ref counts incremented. The fast paths below are pure performance — they never relax this invariant.
+**Invariant**: a snapshot that appears in the list has a complete manifest, every referenced chunk on disk, and ref counts incremented. The fast paths below are pure performance — they never relax this invariant.
 
 ### Region-content cache
 
-A per-region soft cache: `sha256(region_bytes) → packed chunk records`. Hits skip parse + per-chunk hashing entirely; misses fall back to the slow path which repopulates.
+The decision: **a region whose bytes haven't changed shouldn't be re-parsed or re-hashed.** A soft per-region cache fingerprints region content once; subsequent snapshots that hit the same content skip straight to the answer. The cache is advisory — stale entries trigger fall-through to the slow path, which rebuilds them.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Cold
-    Cold --> Warm: slow path completes (no externals)
-    Warm --> Stale: gc reclaims a referenced chunk
-    Stale --> Warm: next snapshot re-runs slow path, refreshes row
-    Warm --> Warm: hit — returns cached records, near-zero cost
+    Cold --> Warm: first snapshot of this content
+    Warm --> Warm: subsequent snapshot, hit
+    Warm --> Stale: a referenced chunk gets reclaimed
+    Stale --> Warm: next snapshot rebuilds the entry
 
-    Cold: no row in region_cache
-    Warm: row + every cached chunk hash still present in pool
-    Stale: row exists but some refs missing — caller falls through
+    Cold: never seen this region content
+    Warm: cache valid, skips parse + per-chunk hashing
+    Stale: caller detects mismatch, falls back to slow path
 ```
 
-`backfill_region_cache(world, snap)` shortcuts `Cold → Warm` for snapshots taken before the cache existed: it hashes each .mca's bytes once and pairs the sha with the manifest's pre-computed records — no chunk hashing, no parsing. `ingest_archive` calls it automatically when re-ingesting an already-known archive.
+When upgrading from an older version that didn't write to this cache, re-selecting an already-ingested archive in the wizard will silently backfill its entries — no chunk-store work redone, just the cheap fingerprinting step.
 
-Regions containing external (`.mcc`) chunks always stay `Cold`. Their fingerprint depends on .mcc bytes too, so keying by region_sha alone would return stale hashes — they benefit from the bulk SQLite probe but never from cache hits.
+A few region shapes intentionally stay `Cold` (those whose fingerprint depends on more than the region file's own bytes). They still benefit from the bulk presence probe inside the slow path, just not from cache hits.
 
 ---
 
@@ -355,22 +343,19 @@ chunkvault hashes the chunk's compression byte + payload — i.e. the bytes that
 | Server restart, no edits | ✗ (entire pool unchanged) |
 | Cross-version world conversion | ✓ (chunks rewritten by MC; we keep both) |
 
-For external chunks (`c.X.Z.mcc`, MC's escape hatch for huge chunks), the pool keys by `(region_blob, mcc_blob)` so the .mcc file's bytes participate in the hash.
+For MC's escape hatch where a single chunk overflows into a sidecar file, the pool keys on the combined content so the sidecar's bytes participate in the identity.
 
 ---
 
 ## Performance characteristics
 
-| Operation | 100 GB world, warm cache |
-|---|---|
-| Cold first snapshot | 5 – 15 min (one-time, I/O-bound) |
-| Incremental snapshot (typical session) | seconds – tens of seconds |
-| Diff between any two snapshots | **milliseconds** (manifest-only) |
-| Verify (rehash everything) | minutes (proportional to repo size) |
-| GC after a delete | O(reclaimed blobs), seconds |
-| Single-file restore | tens of milliseconds |
+The decisions that matter, not the wall-clock numbers (which depend on your hardware and world size):
 
-346 unit + integration tests covering MCA parsing edge cases, chunk-level dedup correctness, ref-counted gc bootstrap, cross-platform `session.lock` detection, and synthetic multi-server ingest end-to-end. Suite runs in **~20 seconds**.
+- **Diffs are manifest-only.** Comparing any two snapshots reads two manifests; it doesn't touch the chunk pool. Diff cost is independent of world size.
+- **Incremental snapshots scale with what changed.** Unchanged regions short-circuit on a content fingerprint; cold regions still pay parse + hash, but at most once per unique content.
+- **GC is ref-count driven.** Deleting a snapshot decrements counts; gc reclaims only what hit zero. No sweep over the full snapshot history.
+- **Single-file restore is O(file).** Manifest tells us which chunks reassemble the file; we read just those.
+- **Verify is intentionally expensive.** Full re-hash of the pool — meant to be run periodically as a smoke test, not on every write.
 
 ---
 
@@ -387,7 +372,7 @@ For external chunks (`c.X.Z.mcc`, MC's escape hatch for huge chunks), the pool k
 
 ## A realistic deployment
 
-You have ~8 TB of historical backups spread across two drives, accumulated as `YYYY-MM-DD-HH-MM-SS.zip` archives, each containing `EX-Server/` and `CR-Server/` folders with full server trees inside. Target: fit it all in a 2 TB SSD.
+You have years of accumulated archives across multiple drives, each one a timestamped zip containing one or more server folders with full trees inside. Target: dedupe them into a single vault.
 
 ```bash
 chunkvault init D:/backup-vault
@@ -401,15 +386,12 @@ done
 # Or skip the loop and let the wizard scan both drives for you:
 chunkvault          # → menu → ingest → confirm
 
-chunkvault list   D:/backup-vault                # see all snapshots
-chunkvault verify D:/backup-vault                # re-hash everything
-chunkvault diff-snaps D:/backup-vault \
-    EX-Server-2024-08-15-23-30-00 \
-    EX-Server-2025-04-25-12-34-56 \
-    --html cross-version-diff.html
+chunkvault list   D:/backup-vault       # see all snapshots
+chunkvault verify D:/backup-vault       # re-hash everything
+chunkvault diff-snaps D:/backup-vault SNAP_A SNAP_B --html diff.html
 ```
 
-Expected outcome: `~700 GB – 1.3 TB` on disk depending on how active your servers were. Logs occupy a separate `logs/` pool, browsable via `chunkvault logs-list / logs-extract`.
+Logs live in a separate pool, browsable independently via `chunkvault logs-list` / `logs-extract`.
 
 ---
 
@@ -455,4 +437,4 @@ redistribution or derivative work.
 
 ---
 
-<sub>Made for a server with 100+ historical snapshots that needed to fit in 2 TB. If it fits yours, even better.</sub>
+<sub>Built for keeping years of historical save data without the repo growing linearly with snapshot count.</sub>
