@@ -353,6 +353,87 @@ def cmd_verify_roundtrip(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify_folders(args: argparse.Namespace) -> int:
+    """Compare two directory trees byte-for-byte and print a detailed report.
+
+    Decoupled from any repo / snapshot — useful for ad-hoc checks like "I
+    restored snapshot X here, and I extracted the source archive there; do
+    they actually match?". Same comparator as ``verify-roundtrip``: chunk-
+    level for .mca regions, byte-level for everything else.
+    """
+    from .store.roundtrip import compare_directories
+    exclude = tuple(args.exclude) if args.exclude else None
+    report = compare_directories(args.left, args.right, exclude=exclude)
+    print(report.summary())
+    if args.report:
+        _write_verify_folders_report(args.report, args.left, args.right, report)
+        print(f"detailed report: {args.report}")
+    if not report.passed:
+        # Console preview — full lists go in --report file.
+        for cm in report.chunk_mismatches[:20]:
+            print(f"  chunk {cm.kind} {cm.dimension_key} "
+                  f"r.{cm.rx}.{cm.rz} ({cm.cx},{cm.cz}) {cm.detail}",
+                  file=sys.stderr)
+        for fm in report.file_mismatches[:20]:
+            print(f"  file {fm.kind}: {fm.relative_path}", file=sys.stderr)
+        for r in report.regions_only_in_source[:20]:
+            print(f"  region only in left: {r}", file=sys.stderr)
+        for r in report.regions_only_in_restore[:20]:
+            print(f"  region only in right: {r}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _write_verify_folders_report(
+    out_path: Path, left: Path, right: Path, report,
+) -> None:
+    """Detailed text report — full mismatch lists, no truncation."""
+    lines = [
+        f"chunkvault verify-folders report",
+        f"left  (a): {left}",
+        f"right (b): {right}",
+        f"",
+        report.summary(),
+        f"",
+    ]
+    if report.regions_only_in_source:
+        lines.append(f"## regions only in left ({len(report.regions_only_in_source)})")
+        lines.extend(f"  {r}" for r in report.regions_only_in_source)
+        lines.append("")
+    if report.regions_only_in_restore:
+        lines.append(f"## regions only in right ({len(report.regions_only_in_restore)})")
+        lines.extend(f"  {r}" for r in report.regions_only_in_restore)
+        lines.append("")
+    if report.chunk_mismatches:
+        lines.append(f"## chunk mismatches ({len(report.chunk_mismatches)})")
+        for cm in report.chunk_mismatches:
+            lines.append(
+                f"  {cm.kind}  {cm.dimension_key}/r.{cm.rx}.{cm.rz} "
+                f"chunk ({cm.cx},{cm.cz}) {cm.detail}".rstrip()
+            )
+        lines.append("")
+    if report.file_mismatches:
+        lines.append(f"## file mismatches ({len(report.file_mismatches)})")
+        for fm in report.file_mismatches:
+            sizes = ""
+            if fm.source_size >= 0 or fm.restore_size >= 0:
+                sizes = f"  (left={fm.source_size}, right={fm.restore_size})"
+            lines.append(f"  {fm.kind}  {fm.relative_path}{sizes}")
+        lines.append("")
+    if report.errors:
+        lines.append(f"## errors ({len(report.errors)})")
+        lines.extend(f"  {e}" for e in report.errors)
+        lines.append("")
+    if report.files_excluded_from_snapshot:
+        lines.append(
+            f"## files excluded by --exclude pattern, only in left "
+            f"({len(report.files_excluded_from_snapshot)})"
+        )
+        lines.extend(f"  {f}" for f in report.files_excluded_from_snapshot)
+        lines.append("")
+    Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+
+
 def cmd_browse(args: argparse.Namespace) -> int:
     """Spin up a local Leaflet-based browser for visualizing the vault."""
     from .viz.browser import serve
@@ -679,6 +760,22 @@ def build_parser() -> argparse.ArgumentParser:
     vrt.add_argument("original", type=Path,
                      help="path to the original world to compare against")
     vrt.set_defaults(func=cmd_verify_roundtrip)
+
+    vf = sub.add_parser("verify-folders",
+                        help="Compare two directory trees and report any "
+                             "mismatched / missing / extra files. Chunk-level "
+                             "diff on .mca regions, byte-level on the rest.")
+    vf.add_argument("left", type=Path, help="left side (treated as 'source')")
+    vf.add_argument("right", type=Path, help="right side (treated as 'restore')")
+    vf.add_argument("--exclude", action="append", default=None,
+                    help="glob pattern; files matching it on the LEFT are "
+                         "treated as 'expected absence' if missing on the "
+                         "right. Repeatable.")
+    vf.add_argument("--report", type=Path, default=None,
+                    help="Write a detailed text report (full mismatch lists) "
+                         "to this path; otherwise only a summary + console "
+                         "preview is printed.")
+    vf.set_defaults(func=cmd_verify_folders)
 
     br = sub.add_parser("browse",
                         help="Start a local HTTP server with a Leaflet "

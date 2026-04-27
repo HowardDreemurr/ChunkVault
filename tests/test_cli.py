@@ -479,3 +479,54 @@ def test_cli_chunk_store_gc(tmp_path: Path, capsys):
     assert "gc complete" in out
     # Reported counts are present
     assert "removed" in out and "chunks" in out
+
+
+# ---- verify-folders --------------------------------------------------------
+
+def test_cli_verify_folders_pass(tmp_path: Path, capsys):
+    a = _world(tmp_path, "a")
+    b = _world(tmp_path, "b")
+    rc = main(["verify-folders", str(a), str(b)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "PASS" in out
+
+
+def test_cli_verify_folders_fail_on_diff(tmp_path: Path, capsys):
+    a = _world(tmp_path, "a", payload=b"v1")
+    b = _world(tmp_path, "b", payload=b"v2")
+    rc = main(["verify-folders", str(a), str(b)])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "FAIL" in captured.out
+    # Mismatch preview lands on stderr
+    assert "hash_mismatch" in captured.err
+
+
+def test_cli_verify_folders_writes_detailed_report(tmp_path: Path, capsys):
+    a = _world(tmp_path, "a", payload=b"v1")
+    b = _world(tmp_path, "b", payload=b"v2")
+    (a / "extra-on-left.txt").write_bytes(b"only-here")
+    report_path = tmp_path / "report.txt"
+    rc = main([
+        "verify-folders", str(a), str(b),
+        "--report", str(report_path),
+    ])
+    assert rc == 1
+    assert report_path.is_file()
+    content = report_path.read_text(encoding="utf-8")
+    assert "FAIL" in content
+    assert "chunk mismatches" in content
+    assert "extra-on-left.txt" in content
+
+
+def test_cli_verify_folders_exclude_pattern(tmp_path: Path, capsys):
+    a = _world(tmp_path, "a")
+    b = _world(tmp_path, "b")
+    (a / "session.lock").write_bytes(b"x")
+    rc = main([
+        "verify-folders", str(a), str(b),
+        "--exclude", "session.lock",
+    ])
+    assert rc == 0  # excluded → not a mismatch
+

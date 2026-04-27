@@ -7,7 +7,9 @@ import pytest
 
 from chunkvault.store import ChunkSnapshotRepo
 from chunkvault.store.repo import RoundTripVerificationError
-from chunkvault.store.roundtrip import RoundTripReport, verify_roundtrip
+from chunkvault.store.roundtrip import (
+    RoundTripReport, compare_directories, verify_roundtrip,
+)
 
 from tests._fixtures import ChunkSpec, write_mcc, write_region_file
 
@@ -188,3 +190,61 @@ def test_report_summary_structure():
                        kind="hash_mismatch")
     )
     assert "FAIL" in r.summary()
+
+
+# ---- compare_directories (the verify-folders backend) ----------------------
+
+def test_compare_directories_identical_passes(tmp_path: Path):
+    a = _world(tmp_path / "a")
+    b = _world(tmp_path / "b")  # same fixture content, written independently
+    report = compare_directories(a, b)
+    assert report.passed
+    assert report.chunks_matching == report.chunks_checked == 4
+    assert not report.regions_only_in_source
+    assert not report.regions_only_in_restore
+
+
+def test_compare_directories_detects_differing_chunk(tmp_path: Path):
+    a = _world(tmp_path / "a")
+    b = _world(tmp_path / "b")
+    # Mutate one chunk in b
+    write_region_file(b, "region", 0, 0, [
+        ChunkSpec(0, 0, 1, 2, b"chunk-A-CHANGED"),
+        ChunkSpec(1, 0, 1, 2, b"chunk-B"),
+        ChunkSpec(2, 2, 1, 2, b"chunk-C"),
+    ])
+    report = compare_directories(a, b)
+    assert not report.passed
+    assert any(cm.kind == "hash_mismatch" for cm in report.chunk_mismatches)
+
+
+def test_compare_directories_detects_extra_and_missing_files(tmp_path: Path):
+    a = _world(tmp_path / "a")
+    b = _world(tmp_path / "b")
+    (a / "only-in-a.txt").write_bytes(b"hello")
+    (b / "only-in-b.txt").write_bytes(b"world")
+    report = compare_directories(a, b)
+    kinds = {fm.kind for fm in report.file_mismatches}
+    assert "missing_in_restore" in kinds  # only-in-a.txt absent on right
+    assert "extra_in_restore" in kinds    # only-in-b.txt absent on left
+
+
+def test_compare_directories_exclude_pattern_treats_as_expected_absence(
+    tmp_path: Path,
+):
+    a = _world(tmp_path / "a")
+    b = _world(tmp_path / "b")
+    (a / "session.lock").write_bytes(b"x")
+    report = compare_directories(a, b, exclude=("session.lock",))
+    # Should NOT be reported as a file mismatch.
+    assert not any(
+        fm.relative_path == "session.lock" for fm in report.file_mismatches
+    )
+    assert "session.lock" in report.files_excluded_from_snapshot
+
+
+def test_compare_directories_rejects_non_directory(tmp_path: Path):
+    a = _world(tmp_path / "a")
+    not_a_dir = tmp_path / "missing"
+    with pytest.raises(Exception):
+        compare_directories(a, not_a_dir)

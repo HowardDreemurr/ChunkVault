@@ -97,6 +97,45 @@ class RoundTripReport:
         )
 
 
+def compare_directories(
+    a: Path | str,
+    b: Path | str,
+    *,
+    exclude: Iterable[str] | None = None,
+    progress_cb: ProgressCallback = None,
+) -> RoundTripReport:
+    """Byte-level comparison of two world-shaped directory trees.
+
+    Reuses the round-trip comparator (region-by-region chunk hash compare +
+    non-region byte-equality compare), but skips the snapshot/restore step.
+    Intended for ad-hoc audits — e.g. "I restored a snapshot here, and the
+    archive's contents are extracted there; do they match?".
+
+    The report's ``regions_only_in_source`` / ``regions_only_in_restore``
+    name the LEFT (``a``) side as ``source`` and the RIGHT (``b``) side as
+    ``restore`` for compatibility with the existing :class:`RoundTripReport`
+    fields. ``exclude`` is matched against paths in ``a`` only (mirrors the
+    snapshot semantics — if a file is excluded from ``a`` and absent in
+    ``b``, that's "expected", not a mismatch).
+    """
+    a_path = Path(a)
+    b_path = Path(b)
+    if not a_path.is_dir():
+        raise ChunkRepoError(f"left side is not a directory: {a_path}")
+    if not b_path.is_dir():
+        raise ChunkRepoError(f"right side is not a directory: {b_path}")
+
+    exclude_patterns = tuple(exclude) if exclude is not None else ()
+    report = RoundTripReport()
+    _compare_regions(a_path, b_path, report, progress_cb)
+    _compare_files(a_path, b_path, exclude_patterns, report, progress_cb)
+    _emit(progress_cb, ProgressEvent(
+        kind="finish", phase="compare_directories",
+        label=report.summary(),
+    ))
+    return report
+
+
 def verify_roundtrip(
     repo: "ChunkSnapshotRepo",
     snapshot,
