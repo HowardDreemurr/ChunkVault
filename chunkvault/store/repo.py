@@ -185,6 +185,11 @@ class RepairReport:
     """Result of :meth:`ChunkSnapshotRepo.repair_timestamps`."""
     scanned: int = 0
     already_correct: int = 0
+    # Count of snapshots whose manifest header had last_played_ms == 0 but
+    # whose level.dat in the file pool was successfully read to recover it.
+    # This is the "rescue" path for snapshots taken before chunkvault
+    # started reading LastPlayed at ingest time.
+    recovered_from_pool: int = 0
     no_last_played: list[tuple[str, str]] = field(default_factory=list)  # (id, label)
     unreadable: list[tuple[str, str]] = field(default_factory=list)      # (id, error)
     to_retime: list[RetimePlan] = field(default_factory=list)
@@ -204,6 +209,7 @@ class RepairReport:
         return (
             f"{verdict}  scanned={self.scanned}, correct={self.already_correct}, "
             f"need_retime={len(self.to_retime)}, "
+            f"recovered_from_pool={self.recovered_from_pool}, "
             f"duplicate_groups={len(self.duplicate_groups)}, "
             f"to_delete={len(self.to_delete)}, "
             f"no_last_played={len(self.no_last_played)}, "
@@ -1737,8 +1743,13 @@ class ChunkSnapshotRepo:
             total=len(all_snaps),
         ))
 
-        # Per-snapshot state: (snap, current_ts_ms, target_ts_ms_or_None)
-        plans: list[tuple[ChunkSnapshot, int, int | None]] = []
+        # Per-snapshot state: (snap, current_ts_ms, target_ts_ms_or_None,
+        #                      recovered_lp_or_None)
+        # recovered_lp is set when we pulled LastPlayed out of the file pool
+        # (instead of finding it pre-recorded in the manifest header). On
+        # apply we'll persist it back to the manifest so future runs see
+        # the field directly.
+        plans: list[tuple[ChunkSnapshot, int, int | None, int | None]] = []
         for i, snap in enumerate(all_snaps, 1):
             try:
                 manifest = read_manifest(snap.manifest_path)
@@ -1751,11 +1762,21 @@ class ChunkSnapshotRepo:
                 continue
             current_ts_ms = manifest.header.timestamp_ms
             lp_ms = manifest.header.last_played_ms
+            recovered: int | None = None
+            if not lp_ms:
+                # Pre-fix-era manifest: try to pull level.dat out of the
+                # file pool and read LastPlayed there. The bytes are
+                # content-addressed and immutable, so this works as well
+                # now as it did at ingest time.
+                recovered = self._recover_last_played_from_pool(manifest)
+                if recovered:
+                    lp_ms = recovered
+                    report.recovered_from_pool += 1
             if not lp_ms:
                 report.no_last_played.append((snap.id, snap.label or ""))
-                plans.append((snap, current_ts_ms, None))
+                plans.append((snap, current_ts_ms, None, None))
             else:
-                plans.append((snap, current_ts_ms, lp_ms))
+                plans.append((snap, current_ts_ms, lp_ms, recovered))
             _emit(progress_cb, ProgressEvent(
                 kind="phase_progress", phase="repair_scan",
                 current=i, total=len(all_snaps),
@@ -1763,7 +1784,7 @@ class ChunkSnapshotRepo:
 
         # Group by (world_name, target_ts_ms) for those that have a target.
         groups: dict[tuple[str, int], list[tuple[ChunkSnapshot, int]]] = {}
-        for snap, cur_ts, target in plans:
+        for snap, cur_ts, target, _rec in plans:
             if target is None:
                 continue
             groups.setdefault((snap.world_name, target), []).append((snap, cur_ts))
@@ -1793,10 +1814,16 @@ class ChunkSnapshotRepo:
                 report.to_delete.append((loser.id, loser.label or ""))
 
         # Compute retime plan for surviving snapshots.
-        for snap, cur_ts, target in plans:
+        recovered_for: dict[str, int] = {}    # snap_id -> recovered_lp_ms
+        for snap, cur_ts, target, recovered in plans:
             if snap.id in delete_ids or target is None:
                 continue
             if cur_ts == target:
+                # Already correctly placed. If we recovered LP from the pool,
+                # still queue a manifest update so the field gets persisted
+                # — otherwise the next repair run does the recovery again.
+                if recovered is not None:
+                    recovered_for[snap.id] = recovered
                 report.already_correct += 1
                 continue
             old_label = snap.label or ""
@@ -1811,6 +1838,8 @@ class ChunkSnapshotRepo:
                 old_label=old_label,
                 new_label=new_label,
             ))
+            if recovered is not None:
+                recovered_for[snap.id] = recovered
 
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="repair_scan",
@@ -1848,6 +1877,12 @@ class ChunkSnapshotRepo:
                 self.retime_snapshot(plan.snap_id, new_ts)
                 if plan.new_label != plan.old_label:
                     self._rename_snapshot_label(plan.snap_id, plan.new_label)
+                # Persist recovered LP to the manifest header so subsequent
+                # repair-timestamps runs see it directly without re-pulling
+                # from the file pool.
+                lp = recovered_for.get(plan.snap_id)
+                if lp is not None:
+                    self._persist_last_played_ms(plan.snap_id, lp)
                 report.retimed.append(plan.snap_id)
             except Exception as e:
                 report.errors.append(("retime", plan.snap_id, str(e)))
@@ -1856,6 +1891,15 @@ class ChunkSnapshotRepo:
                 kind="phase_progress", phase="repair_apply",
                 current=applied,
             ))
+        # Already-correct snapshots can also have their recovered LP persisted
+        # for the same reason (so future repair runs are O(scan) only).
+        for snap_id, lp in recovered_for.items():
+            if snap_id in [p.snap_id for p in report.to_retime]:
+                continue   # already handled above
+            try:
+                self._persist_last_played_ms(snap_id, lp)
+            except Exception as e:
+                report.errors.append(("persist_lp", snap_id, str(e)))
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="repair_apply",
             current=applied,
@@ -1863,6 +1907,57 @@ class ChunkSnapshotRepo:
 
         report.applied = True
         return report
+
+    def _recover_last_played_from_pool(
+        self, manifest: "Manifest",
+    ) -> int | None:
+        """Pull a snapshot's level.dat out of the file pool and read its
+        ``Data.LastPlayed`` field — without needing the source archive.
+
+        Solves the upgrade case: snapshots written by chunkvault versions
+        before level.dat-as-authoritative-ts was added have
+        ``manifest.header.last_played_ms == 0`` even though the snapshot
+        itself includes the level.dat file in its non-region files list.
+        That file's bytes are content-addressed in ``files/`` and
+        unchanged since ingest, so we can reconstruct the
+        ``LastPlayed`` value at any later time.
+
+        Returns the recovered Unix-epoch ms, or None if no level.dat is
+        in this snapshot's files (or none parseable). Doesn't touch
+        ``level.dat_old`` — that's MC's backup-of-backup, may be stale.
+        """
+        import gzip
+        from pathlib import PurePosixPath
+        from ..mca.nbt_lite import find_last_played
+
+        # Collect every level.dat the manifest references; prefer ones
+        # at top level / 'world/' over deeper paths (Bukkit's `world/`
+        # is the canonical save).
+        candidates: list[tuple[int, "FileRecord"]] = []
+        for f in manifest.files:
+            name = PurePosixPath(f.relative_path).name
+            if name != "level.dat":
+                continue
+            depth = f.relative_path.count("/")
+            # Sort key: depth (shallower first), then path itself for
+            # determinism. world/level.dat (depth 1) wins over
+            # world_nether/level.dat (depth 1, same depth) by alphabetic
+            # — fine, they share the same LastPlayed in practice anyway.
+            candidates.append((depth, f))
+        candidates.sort(key=lambda x: (x[0], x[1].relative_path))
+
+        for _, fr in candidates:
+            blob = self.chunks.read_file(fr.sha256)
+            if blob is None:
+                continue
+            try:
+                nbt = gzip.decompress(blob)
+            except Exception:
+                continue
+            lp = find_last_played(nbt)
+            if lp is not None and lp > 0:
+                return lp
+        return None
 
     def _maybe_retitle_label(
         self, old_label: str, world_name: str,
@@ -1881,6 +1976,16 @@ class ChunkSnapshotRepo:
             return old_label
         new_ts = datetime.fromtimestamp(new_ts_ms / 1000, tz=timezone.utc)
         return f"{world_name}-{new_ts.strftime('%Y-%m-%d-%H-%M-%S')}"
+
+    def _persist_last_played_ms(self, snap_id: str, lp_ms: int) -> None:
+        """Write a recovered ``last_played_ms`` into the manifest header so
+        future repair runs see it pre-recorded."""
+        snap = self.get(snap_id)
+        if snap is None:
+            raise ChunkRepoError(f"snapshot vanished mid-repair: {snap_id}")
+        manifest = read_manifest(snap.manifest_path)
+        manifest.header.last_played_ms = lp_ms
+        write_manifest(snap.manifest_path, manifest)
 
     def _rename_snapshot_label(self, snap_id: str, new_label: str) -> None:
         """Persist a label rename to both the manifest header and the index

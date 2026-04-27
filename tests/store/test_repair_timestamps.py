@@ -218,6 +218,80 @@ def test_repair_keeps_correctly_timestamped_winner(tmp_path: Path):
 
 # ---- guard cases ------------------------------------------------------------
 
+def test_repair_recovers_last_played_from_file_pool(tmp_path: Path):
+    """The killer feature: even when a snapshot's manifest has
+    last_played_ms=0 (because it was taken by an older chunkvault that
+    didn't read level.dat at ingest time), the level.dat itself is in
+    the file pool — content-addressed, immutable. Repair pulls it out,
+    parses LastPlayed, and uses that. No source archive needed."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    lp_in_level_dat = 1_700_000_000_000   # 2023-11-14
+    world = _seed_world(tmp_path, "EX-Server", last_played_ms=lp_in_level_dat)
+    snap = repo.snapshot(world, label="x", world_name="EX-Server")
+
+    # Simulate a pre-fix-era manifest: nuke last_played_ms in the header
+    # while keeping the level.dat *file* in the pool intact.
+    manifest = read_manifest(snap.manifest_path)
+    assert manifest.header.last_played_ms == lp_in_level_dat   # baseline
+    manifest.header.last_played_ms = 0
+    write_manifest(snap.manifest_path, manifest)
+
+    # Also corrupt the snapshot's ts/label to look like a now()-fallback
+    # ingest produced it.
+    _corrupt_timestamp_to_now(repo, snap.id, 1_900_000_000_000)
+    # _corrupt rewrote the manifest, restoring last_played_ms to 0 again
+    # (it preserves the rest of the header). Re-zero in case.
+    manifest = read_manifest(snap.manifest_path)
+    manifest.header.last_played_ms = 0
+    write_manifest(snap.manifest_path, manifest)
+
+    # Dry-run should report recovered_from_pool=1 and a retime plan
+    dry = repo.repair_timestamps(dry_run=True)
+    assert dry.recovered_from_pool == 1
+    assert len(dry.to_retime) == 1
+    assert dry.to_retime[0].new_ts_ms == lp_in_level_dat
+
+    # Apply: snapshot gets retimed AND the manifest's last_played_ms gets
+    # persisted so future runs don't have to re-pull from the pool.
+    result = repo.repair_timestamps(dry_run=False)
+    assert result.applied
+    assert result.recovered_from_pool == 1
+    fixed = repo.get(snap.id)
+    assert int(fixed.timestamp.timestamp() * 1000) == lp_in_level_dat
+    fixed_manifest = read_manifest(fixed.manifest_path)
+    assert fixed_manifest.header.last_played_ms == lp_in_level_dat
+
+    # A second run should now find it pre-recorded — no recovery needed.
+    second = repo.repair_timestamps(dry_run=True)
+    assert second.recovered_from_pool == 0
+    assert second.already_correct >= 1
+
+
+def test_repair_recovery_handles_corrupt_level_dat(tmp_path: Path):
+    """If the level.dat blob in the pool is unreadable (e.g. truncated),
+    recovery falls through to no_last_played — never crashes."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _seed_world(tmp_path, "EX-Server", last_played_ms=1_700_000_000_000)
+    snap = repo.snapshot(world, label="x", world_name="EX-Server")
+
+    manifest = read_manifest(snap.manifest_path)
+    manifest.header.last_played_ms = 0
+    write_manifest(snap.manifest_path, manifest)
+
+    # Corrupt the level.dat blob in the pool
+    for f in manifest.files:
+        if f.relative_path.endswith("level.dat"):
+            blob_path = repo.chunks._file_path(f.sha256)
+            blob_path.write_bytes(b"not-gzip")
+            break
+
+    report = repo.repair_timestamps(dry_run=True)
+    assert report.recovered_from_pool == 0
+    assert any(sid == snap.id for sid, _ in report.no_last_played)
+
+
 def test_repair_skips_snapshots_without_last_played(tmp_path: Path):
     """If the manifest has no LastPlayed, we can't auto-fix — must skip
     cleanly and report it, never delete it."""

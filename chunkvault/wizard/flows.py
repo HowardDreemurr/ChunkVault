@@ -586,8 +586,14 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
     )
     repo = _pick_or_create_repo(console, env)
 
-    console.print("[dim]scanning vault…[/dim]")
-    dry = repo.repair_timestamps(dry_run=True)
+    # The scan reads every manifest off disk. With hundreds of snapshots
+    # on a slow drive that's tens of seconds to minutes — wire a progress
+    # bar so it doesn't look like the wizard hung.
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("repair: scanning", total=None)
+        cb = _make_phase_cb(progress, task, prefix="repair")
+        dry = repo.repair_timestamps(dry_run=True, progress_cb=cb)
     console.print(f"[bold]{dry.summary()}[/bold]")
 
     if dry.no_last_played:
@@ -661,7 +667,11 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
         console.print("[dim]cancelled — vault unchanged.[/dim]")
         return
 
-    result = repo.repair_timestamps(dry_run=False)
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("repair: applying", total=None)
+        cb = _make_phase_cb(progress, task, prefix="repair")
+        result = repo.repair_timestamps(dry_run=False, progress_cb=cb)
     console.print(f"[green]{result.summary()}[/green]")
     if result.errors:
         console.print(
