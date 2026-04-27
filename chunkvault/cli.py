@@ -217,10 +217,22 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             f"Repo not initialized: {args.repo}. "
             f"Run `chunkvault init {args.repo}` first."
         )
+    forced_ts = None
+    if getattr(args, "force_timestamp", None):
+        from datetime import datetime, timezone
+        try:
+            forced_ts = datetime.fromisoformat(args.force_timestamp)
+        except ValueError as e:
+            print(f"!! invalid --force-timestamp {args.force_timestamp!r}: {e}",
+                  file=sys.stderr)
+            return 2
+        if forced_ts.tzinfo is None:
+            forced_ts = forced_ts.replace(tzinfo=timezone.utc)
     result = ingest_archive(
         repo, args.archive,
         skip_logs=args.skip_logs,
         verify_roundtrip=not args.no_verify,
+        timestamp=forced_ts,
     )
     print(f"ingested {args.archive.name}")
     print(f"  servers: {', '.join(result.server_names) or '(none)'}")
@@ -819,6 +831,14 @@ def build_parser() -> argparse.ArgumentParser:
     ing.add_argument("--no-verify", action="store_true",
                      help="Skip post-snapshot round-trip verification "
                           "(default ON; speeds up bulk ingest).")
+    ing.add_argument(
+        "--force-timestamp", type=str, default=None, metavar="ISO8601",
+        help="Override the snapshot timestamp for ALL servers in this "
+             "archive. By default chunkvault reads each server's "
+             "level.dat LastPlayed; use this only when level.dat lacks "
+             "the field and you can supply a known-good ts another way "
+             "(e.g. '2024-06-15T10:30:00').",
+    )
     ing.set_defaults(func=cmd_ingest)
 
     vrt = sub.add_parser("verify-roundtrip",

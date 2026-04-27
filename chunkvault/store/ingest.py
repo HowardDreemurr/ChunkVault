@@ -272,12 +272,26 @@ def ingest_archive(
     one log snapshot for the whole archive. Returns metadata about what
     was created. Survives per-server errors: a corrupt EX-Server doesn't
     block CR-Server's snapshot.
+
+    **Timestamp policy (idempotency-critical):** each server's snapshot
+    timestamp is read from its own ``level.dat``'s ``LastPlayed`` field.
+    This is the only source that's stable across re-ingests of the same
+    archive — filename parsing was historically the source, but it could
+    fall back to ``datetime.now()`` on unrecognized formats and produce
+    unstable labels (different ts per re-ingest, breaking the
+    ``already_ingested`` check, creating duplicate snapshots).
+
+    A server whose ``level.dat`` lacks ``LastPlayed`` is **refused** and
+    added to ``result.skipped_servers``; the archive continues with the
+    others. Pass ``timestamp=...`` to force a single ts across all
+    servers (rare; used to recover archives where LastPlayed isn't
+    readable, or for tests). When ``timestamp`` is set it overrides the
+    per-server level.dat read.
     """
+    from .repo import _read_level_dat_last_played
+
     archive_path = Path(archive)
-    ts = timestamp or parse_timestamp_from_name(archive_path.name) \
-        or datetime.now(timezone.utc)
-    ts_label = ts.strftime("%Y-%m-%d-%H-%M-%S")
-    result = IngestResult(archive=archive_path, timestamp=ts, label=ts_label)
+    forced_ts = timestamp.astimezone(timezone.utc) if timestamp else None
 
     _emit(progress_cb, ProgressEvent(
         kind="phase_start", phase="ingest_archive",
@@ -292,9 +306,63 @@ def ingest_archive(
                 f"(looked for any directory containing region/r.X.Z.mca files)"
             )
 
+        # Read each server's authoritative ts from level.dat upfront so the
+        # archive-level fields (used by log snapshot + IngestResult.label)
+        # can be computed from real data, not a fallback.
+        per_server_ts: dict[str, datetime | None] = {}
+        for server in servers:
+            if forced_ts is not None:
+                per_server_ts[server.server_name] = forced_ts
+                continue
+            lp_ms = _read_level_dat_last_played(server.world_root)
+            if lp_ms and lp_ms > 0:
+                per_server_ts[server.server_name] = datetime.fromtimestamp(
+                    lp_ms / 1000, tz=timezone.utc,
+                )
+            else:
+                per_server_ts[server.server_name] = None
+
+        # Archive-level ts used only for log snapshot label + the
+        # IngestResult's display fields. Picks the *latest* per-server
+        # last_played as "the moment this archive captures" — when forced,
+        # uses the override. Falls through to filename / now() ONLY for
+        # logs, not for any world snapshot.
+        valid_ts = [t for t in per_server_ts.values() if t is not None]
+        if forced_ts is not None:
+            archive_ts: datetime | None = forced_ts
+        elif valid_ts:
+            archive_ts = max(valid_ts)
+        else:
+            archive_ts = (
+                parse_timestamp_from_name(archive_path.name)
+                or datetime.now(timezone.utc)
+            )
+        archive_ts_label = archive_ts.strftime("%Y-%m-%d-%H-%M-%S")
+        result = IngestResult(
+            archive=archive_path, timestamp=archive_ts, label=archive_ts_label,
+        )
+
         all_log_files: dict[str, list[tuple[str, bytes]]] = {}
 
         for i, server in enumerate(servers, 1):
+            server_ts = per_server_ts[server.server_name]
+            if server_ts is None:
+                # No LastPlayed and no force — refuse this server. Idempotency
+                # demands a stable ts source per server; falling back here
+                # would re-introduce the "wrong-now() label" bug.
+                reason = (
+                    "level.dat has no LastPlayed field; pass an explicit "
+                    "timestamp=... to ingest_archive to override "
+                    "(or use --force-timestamp on the CLI)"
+                )
+                result.skipped_servers.append((server.server_name, reason))
+                _emit(progress_cb, ProgressEvent(
+                    kind="error", phase="server_world",
+                    label=server.server_name,
+                    detail={"error": reason},
+                ))
+                continue
+            ts_label = server_ts.strftime("%Y-%m-%d-%H-%M-%S")
             label = f"{server.server_name}-{ts_label}"
 
             # Idempotency: if a snapshot with this exact label already exists,
@@ -340,7 +408,7 @@ def ingest_archive(
                 snap = repo.snapshot(
                     server.world_root,
                     label=label,
-                    timestamp=ts,
+                    timestamp=server_ts,
                     allow_live=True,         # archives aren't live worlds
                     verify_roundtrip=verify_roundtrip,
                     world_name=server.server_name,
@@ -364,10 +432,10 @@ def ingest_archive(
                     all_log_files[server.server_name] = files
 
         if not skip_logs and all_log_files:
-            # Idempotency: log snapshots are labelled by archive timestamp,
-            # so re-ingest of the same archive would create a duplicate row
-            # (blobs would dedupe, but rows wouldn't). Skip if present.
-            existing_log = repo.get_log_snapshot(ts_label)
+            # Idempotency: log snapshots are labelled by the archive ts
+            # (max of per-server last_played, see above) so re-ingest is
+            # stable. Skip if present.
+            existing_log = repo.get_log_snapshot(archive_ts_label)
             if existing_log is not None:
                 result.log_snapshot = existing_log
             else:
@@ -378,9 +446,9 @@ def ingest_archive(
                 ))
                 log_snap = repo.add_log_snapshot(
                     all_log_files,
-                    label=ts_label,
+                    label=archive_ts_label,
                     source_path=archive_path,
-                    timestamp=ts,
+                    timestamp=archive_ts,
                 )
                 result.log_snapshot = log_snap
 

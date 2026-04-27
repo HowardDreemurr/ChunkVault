@@ -375,9 +375,14 @@ def test_cli_chunk_store_diff_snaps(tmp_path: Path, capsys):
     assert data["total"] >= 1
 
 
+_FIXTURE_LP_MS = 1_700_000_000_000   # 2023-11-14-22-13-20 UTC
+_FIXTURE_LP_LABEL = "2023-11-14-22-13-20"
+
+
 def _make_multi_server_zip(tmp_path: Path, servers: list[str]) -> Path:
     """Build a zip containing multiple server folders, each with a world dir."""
     import zipfile
+    from tests.store.test_repo import _make_level_dat
     src = tmp_path / "src"
     src.mkdir()
     for name in servers:
@@ -385,7 +390,12 @@ def _make_multi_server_zip(tmp_path: Path, servers: list[str]) -> Path:
         server.mkdir()
         world = server / "world"
         world.mkdir()
-        (world / "level.dat").write_bytes(b"placeholder")
+        # Real level.dat with a fixed LastPlayed so ingest produces a stable,
+        # idempotent label across re-runs (level.dat is the authoritative
+        # snapshot-ts source — see chunkvault/store/ingest.py).
+        (world / "level.dat").write_bytes(_make_level_dat(
+            "1.20.4", 3700, last_played_ms=_FIXTURE_LP_MS,
+        ))
         write_region_file(world, "region", 0, 0, [
             ChunkSpec(0, 0, 1, 2, name.encode()),
         ])
@@ -420,7 +430,7 @@ def test_cli_logs_list_after_ingest(tmp_path: Path, capsys):
     rc = main(["logs-list", str(repo)])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "2025-04-25-12-34-56" in out
+    assert _FIXTURE_LP_LABEL in out
     assert "servers=1" in out
 
 
@@ -431,7 +441,7 @@ def test_cli_logs_extract(tmp_path: Path, capsys):
     main(["ingest", str(repo), str(archive)])
     capsys.readouterr()
     dest = tmp_path / "extracted"
-    rc = main(["logs-extract", str(repo), "2025-04-25-12-34-56", str(dest)])
+    rc = main(["logs-extract", str(repo), _FIXTURE_LP_LABEL, str(dest)])
     assert rc == 0
     assert (dest / "EX-Server" / "logs" / "latest.log").read_bytes() \
         == b"log of EX-Server"
@@ -446,7 +456,7 @@ def test_cli_logs_extract_with_server_filter(tmp_path: Path, capsys):
     main(["ingest", str(repo), str(archive)])
     capsys.readouterr()
     dest = tmp_path / "ex-only"
-    main(["logs-extract", str(repo), "2025-04-25-12-34-56", str(dest),
+    main(["logs-extract", str(repo), _FIXTURE_LP_LABEL, str(dest),
           "--server", "EX-Server"])
     assert (dest / "EX-Server").is_dir()
     assert not (dest / "CR-Server").exists()
@@ -458,7 +468,7 @@ def test_cli_logs_delete(tmp_path: Path, capsys):
     main(["init", str(repo)])
     main(["ingest", str(repo), str(archive)])
     capsys.readouterr()
-    rc = main(["logs-delete", str(repo), "2025-04-25-12-34-56"])
+    rc = main(["logs-delete", str(repo), _FIXTURE_LP_LABEL])
     assert rc == 0
     capsys.readouterr()
     main(["logs-list", str(repo)])

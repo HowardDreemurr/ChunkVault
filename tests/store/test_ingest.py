@@ -19,15 +19,45 @@ from chunkvault.store.progress import ProgressEvent
 
 from tests._fixtures import ChunkSpec, write_region_file
 
+# Synthetic MC version for fixture level.dat files. The value is arbitrary —
+# any real-looking (version_name, data_version) pair works for tests that
+# don't care about cross-version semantics. We pin a single pair so any test
+# that DOES compare versions has something stable to assert against.
+_FIXTURE_MC_VERSION = "1.20.4"
+_FIXTURE_DATA_VERSION = 3700
+# Fixed last_played so re-ingest produces the same label across runs (the
+# whole point of the level.dat-as-authoritative-ts policy). 2023-11-14 UTC.
+_FIXTURE_LAST_PLAYED_MS = 1_700_000_000_000
+
 
 # ---- helpers ---------------------------------------------------------------
 
-def _make_server(root: Path, name: str, *, payload: bytes = b"x") -> Path:
+def _make_server(
+    root: Path, name: str, *,
+    payload: bytes = b"x",
+    last_played_ms: int | None = _FIXTURE_LAST_PLAYED_MS,
+) -> Path:
+    """Build a synthetic server tree with a real level.dat.
+
+    ``last_played_ms`` defaults to ``_FIXTURE_LAST_PLAYED_MS`` so ingest
+    produces a deterministic, idempotent label. Pass ``None`` to test the
+    "level.dat without LastPlayed" refusal path.
+    """
+    from tests.store.test_repo import _make_level_dat
+
     server = root / name
     server.mkdir(parents=True, exist_ok=True)
     world = server / "world"
     world.mkdir()
-    (world / "level.dat").write_bytes(b"placeholder")
+    if last_played_ms is None:
+        (world / "level.dat").write_bytes(b"placeholder")
+    else:
+        (world / "level.dat").write_bytes(
+            _make_level_dat(
+                _FIXTURE_MC_VERSION, _FIXTURE_DATA_VERSION,
+                last_played_ms=last_played_ms,
+            ),
+        )
     write_region_file(world, "region", 0, 0, [
         ChunkSpec(0, 0, 1, 2, payload),
     ])
@@ -181,8 +211,12 @@ def test_ingest_zip_creates_per_server_snapshots_and_log_snapshot(tmp_path: Path
     _zip_dir(archive, src)
 
     result = ingest_archive(repo, archive)
-    assert result.timestamp == datetime(2025, 4, 25, 12, 34, 56, tzinfo=timezone.utc)
-    assert result.label == "2025-04-25-12-34-56"
+    # ts now comes from level.dat (per the idempotency policy), NOT from
+    # the archive filename. _make_server's default last_played is
+    # 1_700_000_000_000 = 2023-11-14 22:13:20 UTC.
+    expected_ts = datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc)
+    assert result.timestamp == expected_ts
+    assert result.label == "2023-11-14-22-13-20"
     assert sorted(result.server_names) == ["CR-Server", "EX-Server"]
     assert len(result.snapshots) == 2
     assert result.log_snapshot is not None
@@ -190,8 +224,8 @@ def test_ingest_zip_creates_per_server_snapshots_and_log_snapshot(tmp_path: Path
     # World snapshots have correct labels and world_names
     snap_labels = {s.label for s in result.snapshots}
     assert snap_labels == {
-        "EX-Server-2025-04-25-12-34-56",
-        "CR-Server-2025-04-25-12-34-56",
+        "EX-Server-2023-11-14-22-13-20",
+        "CR-Server-2023-11-14-22-13-20",
     }
     snap_world_names = {s.world_name for s in result.snapshots}
     assert snap_world_names == {"EX-Server", "CR-Server"}
@@ -250,17 +284,29 @@ def test_ingest_skip_logs_flag(tmp_path: Path):
     assert sum(1 for p in (repo.repo_path / "logs").rglob("*") if p.is_file()) == 0
 
 
-def test_ingest_uses_filename_timestamp_as_world_label(tmp_path: Path):
+def test_ingest_uses_level_dat_last_played_as_snapshot_timestamp(tmp_path: Path):
+    """Each snapshot's ts must come from its OWN level.dat's LastPlayed,
+    NOT from the archive filename. This is the idempotency-critical
+    policy: archive filenames are unstable (5-component vs 6-component
+    formats, manual renames), level.dat LastPlayed is fixed once the
+    archive is written."""
     repo = ChunkSnapshotRepo(tmp_path / "repo")
     repo.init()
     src = tmp_path / "src"
-    _make_server(src, "EX-Server")
+    _make_server(src, "EX-Server", last_played_ms=_FIXTURE_LAST_PLAYED_MS)
+    # Filename is intentionally a different time — must be IGNORED for snapshot ts
     archive = tmp_path / "2025-04-25-12-34-56.zip"
     _zip_dir(archive, src)
     result = ingest_archive(repo, archive)
     snap = result.snapshots[0]
-    # timestamp comes from filename, not from "now"
-    assert snap.timestamp == datetime(2025, 4, 25, 12, 34, 56, tzinfo=timezone.utc)
+    expected = datetime.fromtimestamp(
+        _FIXTURE_LAST_PLAYED_MS / 1000, tz=timezone.utc,
+    )
+    assert snap.timestamp == expected
+    # Filename time is not relevant: confirm it didn't sneak in.
+    assert snap.timestamp != datetime(
+        2025, 4, 25, 12, 34, 56, tzinfo=timezone.utc,
+    )
 
 
 def test_ingest_is_idempotent_on_re_run(tmp_path: Path):
@@ -293,6 +339,91 @@ def test_ingest_is_idempotent_on_re_run(tmp_path: Path):
     # Repo state unchanged.
     assert len(repo.list()) == snap_count_after_first
     assert len(repo.list_log_snapshots()) == log_snap_count_after_first
+
+
+def test_ingest_refuses_server_without_last_played(tmp_path: Path):
+    """A server whose level.dat lacks LastPlayed must NOT silently fall
+    back to now() — that's the bug that produced 233 wrong-timestamped
+    snapshots in the wild. Refuse, log to skipped_servers, continue."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server", last_played_ms=None)  # no LastPlayed
+    _make_server(src, "CR-Server")  # has LastPlayed (default)
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    result = ingest_archive(repo, archive)
+    # EX-Server refused
+    refused = {name for name, _ in result.skipped_servers}
+    assert "EX-Server" in refused
+    reasons = {name: reason for name, reason in result.skipped_servers}
+    assert "LastPlayed" in reasons["EX-Server"]
+    # CR-Server still snapshotted
+    assert any(s.world_name == "CR-Server" for s in result.snapshots)
+
+
+def test_ingest_force_timestamp_overrides_level_dat(tmp_path: Path):
+    """Caller can explicitly force a timestamp (e.g. for archives whose
+    level.dat lacks LastPlayed and can't be auto-handled). When set, it
+    overrides level.dat for ALL servers in the archive."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server", last_played_ms=None)  # no LastPlayed
+    _make_server(src, "CR-Server", last_played_ms=_FIXTURE_LAST_PLAYED_MS)
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    forced = datetime(2024, 6, 15, 10, 0, 0, tzinfo=timezone.utc)
+    result = ingest_archive(repo, archive, timestamp=forced)
+    # Both servers got snapshotted with the forced ts
+    assert len(result.snapshots) == 2
+    for snap in result.snapshots:
+        assert snap.timestamp == forced
+
+
+def test_ingest_per_server_timestamp_can_differ(tmp_path: Path):
+    """Two servers in one archive with different LastPlayed values get
+    different snapshot timestamps — each derived from its own level.dat."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    lp_ex = 1_700_000_000_000
+    lp_cr = 1_750_000_000_000
+    _make_server(src, "EX-Server", last_played_ms=lp_ex)
+    _make_server(src, "CR-Server", last_played_ms=lp_cr)
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    result = ingest_archive(repo, archive)
+    by_name = {s.world_name: s for s in result.snapshots}
+    assert int(by_name["EX-Server"].timestamp.timestamp() * 1000) == lp_ex
+    assert int(by_name["CR-Server"].timestamp.timestamp() * 1000) == lp_cr
+
+
+def test_ingest_is_idempotent_under_filename_renames(tmp_path: Path):
+    """Renaming the archive file must NOT cause re-ingest to create new
+    snapshots — the level.dat ts is the identity, not the filename."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server")
+
+    # First name (5 components — historically broke the regex, falling to now())
+    a1 = tmp_path / "2025-04-25-12-34.zip"
+    _zip_dir(a1, src)
+    r1 = ingest_archive(repo, a1)
+    assert len(r1.snapshots) == 1
+
+    # Same archive content, different filename
+    a2 = tmp_path / "renamed-backup.zip"
+    _zip_dir(a2, src)
+    r2 = ingest_archive(repo, a2)
+    assert r2.snapshots == []                     # snapshot already exists
+    assert len(r2.already_ingested) == 1
+    # Vault still has only one snapshot
+    assert len(repo.list()) == 1
 
 
 def test_re_ingest_backfills_region_cache(tmp_path: Path):
@@ -337,11 +468,15 @@ def test_ingest_handles_bukkit_layout(tmp_path: Path):
     src = tmp_path / "src"
     server = src / "EX-Server"
     server.mkdir(parents=True)
+    from tests.store.test_repo import _make_level_dat
     for sub in ("world", "world_nether", "world_the_end"):
         d = server / sub
         d.mkdir()
         if sub == "world":
-            (d / "level.dat").write_bytes(b"placeholder")
+            (d / "level.dat").write_bytes(_make_level_dat(
+                _FIXTURE_MC_VERSION, _FIXTURE_DATA_VERSION,
+                last_played_ms=_FIXTURE_LAST_PLAYED_MS,
+            ))
         write_region_file(d, "region", 0, 0, [
             ChunkSpec(0, 0, 1, 2, sub.encode()),
         ])
@@ -369,9 +504,13 @@ def test_ingest_handles_custom_world_name(tmp_path: Path):
     src = tmp_path / "src"
     server = src / "EX-Server"
     server.mkdir(parents=True)
+    from tests.store.test_repo import _make_level_dat
     survival = server / "survival"
     survival.mkdir()
-    (survival / "level.dat").write_bytes(b"placeholder")
+    (survival / "level.dat").write_bytes(_make_level_dat(
+        _FIXTURE_MC_VERSION, _FIXTURE_DATA_VERSION,
+        last_played_ms=_FIXTURE_LAST_PLAYED_MS,
+    ))
     write_region_file(survival, "region", 0, 0, [
         ChunkSpec(0, 0, 1, 2, b"x"),
     ])

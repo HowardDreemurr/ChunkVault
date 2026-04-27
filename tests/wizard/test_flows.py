@@ -64,7 +64,10 @@ def _make_server_zip(tmp_path: Path, server_names: list[str]) -> Path:
         server.mkdir()
         world = server / "world"
         world.mkdir()
-        (world / "level.dat").write_bytes(b"placeholder")
+        from tests.store.test_repo import _make_level_dat
+        (world / "level.dat").write_bytes(_make_level_dat(
+            "1.20.4", 3700, last_played_ms=1_700_000_000_000,
+        ))
         write_region_file(world, "region", 0, 0, [
             ChunkSpec(0, 0, 1, 2, name.encode()),
         ])
