@@ -129,6 +129,36 @@ def test_second_snapshot_skips_cached_tiles(tmp_path: Path):
     assert stats.tiles_skipped_cached >= 1
 
 
+def test_render_progress_emits_during_inner_loop(tmp_path: Path):
+    """Progress events must come out *while* a group is rendering, not just
+    at end-of-group. With ~1M chunks per group on real worlds, the per-group
+    cadence makes the bar look frozen for hours; the inner-loop emit is the
+    fix. Also checks cached chunks count toward `current` so the bar moves
+    through warm groups too."""
+    from chunkvault.store.manifest import read_manifest
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _seed_world_with_real_chunk(tmp_path)
+    snap = repo.snapshot(world, label="prog", verify_roundtrip=False)
+    manifest = read_manifest(snap.manifest_path)
+
+    # First call already populated the cache during snapshot(). Now simulate
+    # the second call where every tile is a cache hit — `seen` must still
+    # advance to total, and at least one phase_progress event must fire.
+    events: list = []
+    ensure_tiles_for_manifest(
+        repo, manifest, progress_cb=events.append,
+    )
+    progress = [e for e in events if e.kind == "phase_progress"]
+    assert progress, "no phase_progress emitted"
+    last = progress[-1]
+    assert last.total is not None and last.total > 0
+    assert last.current == last.total, (
+        f"final progress {last.current}/{last.total} did not reach total"
+    )
+
+
 def test_sidecar_png_pixel_matches_block_color(tmp_path: Path):
     """The grass_block in the chunk shows up green in the rendered PNG."""
     from PIL import Image

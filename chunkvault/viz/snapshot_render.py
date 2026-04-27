@@ -95,6 +95,12 @@ def ensure_tiles_for_manifest(
         total=total_to_check,
     ))
 
+    # Emit a progress update every N chunks while rendering, not just once
+    # per group. With ~1M chunks per group, the per-group cadence makes the
+    # bar look frozen for hours on the first cold pass even though work is
+    # progressing. 256 keeps the rich console responsive without flooding it.
+    _PROGRESS_TICK = 256
+
     seen = 0
     with __import__("chunkvault.store.index", fromlist=["IndexDB"]).IndexDB(
         repo.index_path,
@@ -104,26 +110,44 @@ def ensure_tiles_for_manifest(
             already = index.has_chunk_renders_bulk(unique_hashes, mode)
             stats.tiles_skipped_cached += len(already)
             missing = [h for h in unique_hashes if h not in already]
+            # Skipped-cached count is part of "seen" too — we don't re-render
+            # them, but they're still pairs we've decided about. Bump up
+            # front so the bar reflects progress through the cache-hit prefix.
+            seen += len(already)
+            if already:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="render_tiles",
+                    label=f"{dim_key}/{mode} (cached)",
+                    current=seen, total=total_to_check,
+                ))
             for i, h in enumerate(missing, 1):
                 blob = repo.chunks.read_chunk(h)
                 if blob is None or len(blob) < 1:
                     stats.chunks_failed += 1
-                    continue
-                try:
-                    nbt = decompress_chunk_payload(
-                        blob[0] & ~EXTERNAL_FLAG, blob[1:],
-                    )
-                    tile = render_chunk_nbt(nbt, mode)
-                except (RenderError, Exception):
-                    stats.chunks_failed += 1
-                    continue
-                repo.tiles.store(h, mode, tile)
-                stats.tiles_rendered += 1
+                else:
+                    try:
+                        nbt = decompress_chunk_payload(
+                            blob[0] & ~EXTERNAL_FLAG, blob[1:],
+                        )
+                        tile = render_chunk_nbt(nbt, mode)
+                        repo.tiles.store(h, mode, tile)
+                        stats.tiles_rendered += 1
+                    except (RenderError, Exception):
+                        stats.chunks_failed += 1
+                seen += 1
+                # Emit during the inner loop so a multi-million-chunk group
+                # doesn't appear frozen. Branch is cheap; _emit only runs
+                # once per tick.
+                if i % _PROGRESS_TICK == 0:
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="render_tiles",
+                        label=f"{dim_key}/{mode}",
+                        current=seen, total=total_to_check,
+                    ))
             # Mark the entire group present in the index in one batch
             new_items = [(h, mode) for h in missing]
             if new_items:
                 index.add_chunk_renders(new_items)
-            seen += len(unique_hashes)
             _emit(progress_cb, ProgressEvent(
                 kind="phase_progress", phase="render_tiles",
                 label=f"{dim_key}/{mode}",
