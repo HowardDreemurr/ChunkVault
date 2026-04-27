@@ -80,6 +80,18 @@ CREATE TABLE IF NOT EXISTS chunk_renders (
     ref_count    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (content_hash, mode)
 );
+
+-- Region-content fingerprint cache. Keyed by sha256(region_bytes); the blob
+-- holds the packed ChunkRecord list (cx, cz, compression, timestamp,
+-- content_hash) for that exact region content. Skipping the parse + per-
+-- chunk hash on a cache hit is what makes incremental snapshots actually
+-- incremental: most regions don't change between snapshots, and without
+-- this cache every snapshot re-hashes every chunk in every region. Soft
+-- cache — entries can be evicted at any time, the slow path always works.
+CREATE TABLE IF NOT EXISTS region_cache (
+    region_sha   BLOB PRIMARY KEY,
+    chunks_blob  BLOB NOT NULL
+);
 """
 
 
@@ -307,6 +319,29 @@ class IndexDB:
             )
             present.update(row[0] for row in cur.fetchall())
         return present
+
+    # ---- region content cache ----------------------------------------------
+    # Keyed by sha256 of a region file's bytes. On hit, the snapshot path can
+    # skip reading + parsing + per-chunk hashing entirely. Safe because the
+    # value is fully determined by the bytes, EXCEPT when the region has
+    # external (.mcc) chunks — that case is handled by the caller (it skips
+    # this cache).
+
+    def get_region_cache(self, region_sha: bytes) -> bytes | None:
+        cur = self._conn.execute(
+            "SELECT chunks_blob FROM region_cache WHERE region_sha = ?",
+            (region_sha,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def put_region_cache(self, region_sha: bytes, chunks_blob: bytes) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO region_cache "
+                "(region_sha, chunks_blob) VALUES (?, ?)",
+                (region_sha, chunks_blob),
+            )
 
     def add_chunks(self, hashes: list[bytes]) -> None:
         """Just record presence (ref_count unchanged). Use ``adjust_chunk_refs``

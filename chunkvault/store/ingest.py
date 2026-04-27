@@ -298,15 +298,29 @@ def ingest_archive(
             label = f"{server.server_name}-{ts_label}"
 
             # Idempotency: if a snapshot with this exact label already exists,
-            # the archive has been ingested before. Skip silently — content-
-            # addressed storage means a redundant snapshot wouldn't duplicate
-            # any chunks, but it WOULD add a new manifest + index row, so
-            # skipping is both faster and avoids visual clutter for the user.
+            # the archive has been ingested before. Skip the snapshot work,
+            # but opportunistically backfill the region_cache from the source
+            # tree — for users who ingested under an older version that
+            # didn't write cache rows, this is the only way pre-existing
+            # snapshots ever become "warm" without redoing the full ingest.
+            # The backfill is cheap (one sha256 per region, no per-chunk
+            # hashing) and idempotent (cached entries are skipped).
             existing = repo.get(label)
             if existing is not None:
                 result.already_ingested.append(
                     (server.server_name, existing.short_id),
                 )
+                try:
+                    repo.backfill_region_cache(
+                        server.world_root, existing,
+                        progress_cb=progress_cb,
+                    )
+                except Exception as e:
+                    # Backfill is opportunistic — never block re-ingest on it.
+                    _emit(progress_cb, ProgressEvent(
+                        kind="warning", phase="backfill_region_cache",
+                        label=f"{server.server_name}: {e}",
+                    ))
                 _emit(progress_cb, ProgressEvent(
                     kind="phase_done", phase="server_world",
                     label=f"{server.server_name} (already ingested)",

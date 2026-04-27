@@ -177,6 +177,205 @@ def test_snapshot_only_adds_changed_chunks(tmp_path: Path):
     assert count_after - count_before == 1
 
 
+# ---- region-content cache fast path ----------------------------------------
+# These tests pin the behavior of the sha256-keyed region cache + bulk
+# has_chunks_bulk path in _snapshot_region. The optimization is what makes
+# incremental snapshots actually incremental (without it, every snapshot
+# re-hashes every chunk in every region, even if the .mca file is byte-
+# identical to the previous snapshot's).
+
+
+def test_snapshot_populates_region_cache_after_first_pass(tmp_path: Path):
+    from chunkvault.store.index import IndexDB
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _mk_world(tmp_path)
+    repo.snapshot(world, label="a")
+
+    # Region content cache should have an entry per region file.
+    with IndexDB(repo.index_path) as idx:
+        cur = idx._conn.execute("SELECT COUNT(*) FROM region_cache")
+        (count,) = cur.fetchone()
+    # _mk_world writes two region files (overworld + nether DIM-1)
+    assert count == 2
+
+
+def test_snapshot_region_cache_hit_skips_parse(tmp_path: Path, monkeypatch):
+    """A second snapshot of an identical world must hit the cache, NOT call
+    Region.from_bytes again. This is the whole point of the optimization."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _mk_world(tmp_path)
+    repo.snapshot(world, label="a")
+
+    # Boobytrap: future calls to Region.from_bytes raise. If the second
+    # snapshot still parses regions, this test fails loudly.
+    from chunkvault.store import repo as repo_mod
+    real_from_bytes = repo_mod.Region.from_bytes
+
+    calls = {"n": 0}
+    def trap(*a, **kw):
+        calls["n"] += 1
+        return real_from_bytes(*a, **kw)
+    monkeypatch.setattr(repo_mod.Region, "from_bytes", trap)
+
+    repo.snapshot(world, label="b")
+    assert calls["n"] == 0  # every region must hit the cache
+
+
+def test_snapshot_region_cache_falls_back_when_chunks_gced(tmp_path: Path):
+    """If a cached region's chunks have been removed from the chunks table
+    (e.g. by a future GC), the next snapshot must fall through and re-store
+    them. The cache is a soft optimization, not a source of truth."""
+    from chunkvault.store.index import IndexDB
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _mk_world(tmp_path)
+    repo.snapshot(world, label="a")
+
+    # Wipe the chunks table presence rows (simulate aggressive GC) but leave
+    # the region_cache entries intact. The next snapshot's cache lookup will
+    # see "rows present, but referenced chunks gone" and must rebuild.
+    with IndexDB(repo.index_path) as idx:
+        idx._conn.execute("DELETE FROM chunks")
+        idx._conn.commit()
+    chunks_dir = repo.repo_path / "chunks"
+    for p in list(chunks_dir.rglob("*")):
+        if p.is_file():
+            p.unlink()
+
+    snap = repo.snapshot(world, label="b")
+    # Restore should still work end-to-end
+    dest = tmp_path / "restored"
+    repo.restore(snap, dest)
+    assert (dest / "region" / "r.0.0.mca").is_file()
+
+
+def test_snapshot_skips_region_cache_for_external_chunks(tmp_path: Path):
+    """Regions that contain external (.mcc) chunks must NOT enter the cache.
+    Region bytes alone don't fingerprint such regions: an unchanged .mca
+    can point at a changed .mcc, so cache hits would return stale hashes."""
+    from chunkvault.store.index import IndexDB
+    from chunkvault.mca.region import EXTERNAL_FLAG
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = tmp_path / "extworld"
+    world.mkdir()
+    (world / "level.dat").write_bytes(_make_level_dat("1.20.4", 3700))
+    # One chunk in r.0.0 marks itself external; its body lives in c.0.0.mcc.
+    write_region_file(world, "region", 0, 0, [
+        ChunkSpec(0, 0, 1, 2 | EXTERNAL_FLAG, b""),
+    ])
+    from tests._fixtures import write_mcc
+    write_mcc(world, "region", 0, 0, b"external-payload-bytes")
+
+    repo.snapshot(world, label="a")
+    with IndexDB(repo.index_path) as idx:
+        cur = idx._conn.execute("SELECT COUNT(*) FROM region_cache")
+        (count,) = cur.fetchone()
+    assert count == 0
+
+
+def test_backfill_region_cache_populates_from_existing_snapshot(tmp_path: Path):
+    """Simulates the upgrade path: a snapshot was taken under the old code
+    (no cache rows), then on re-ingest we want backfill to populate the
+    cache from the manifest + source .mca files — without redoing any of
+    the chunk-store work."""
+    from chunkvault.store.index import IndexDB
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _mk_world(tmp_path)
+    snap = repo.snapshot(world, label="legacy")
+
+    # Wipe the region_cache table to simulate "ingested under old version"
+    with IndexDB(repo.index_path) as idx:
+        idx._conn.execute("DELETE FROM region_cache")
+        idx._conn.commit()
+        cur = idx._conn.execute("SELECT COUNT(*) FROM region_cache")
+        assert cur.fetchone()[0] == 0
+
+    stats = repo.backfill_region_cache(world, snap)
+    assert stats.written == 2  # overworld + nether DIM-1
+    assert stats.skipped_external == 0
+    assert stats.errors == 0
+
+    with IndexDB(repo.index_path) as idx:
+        cur = idx._conn.execute("SELECT COUNT(*) FROM region_cache")
+        assert cur.fetchone()[0] == 2
+
+
+def test_backfill_region_cache_is_idempotent(tmp_path: Path):
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _mk_world(tmp_path)
+    snap = repo.snapshot(world, label="x")
+
+    # First call should be a no-op (cache already warm from snapshot's
+    # slow-path write); but the call must not error.
+    stats1 = repo.backfill_region_cache(world, snap)
+    assert stats1.written == 0
+    assert stats1.already_cached == 2
+
+    stats2 = repo.backfill_region_cache(world, snap)
+    assert stats2.written == 0
+    assert stats2.already_cached == 2
+
+
+def test_backfill_skips_regions_with_external_chunks(tmp_path: Path):
+    from chunkvault.mca.region import EXTERNAL_FLAG
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = tmp_path / "ext"
+    world.mkdir()
+    (world / "level.dat").write_bytes(_make_level_dat("1.20.4", 3700))
+    write_region_file(world, "region", 0, 0, [
+        ChunkSpec(0, 0, 1, 2 | EXTERNAL_FLAG, b""),
+    ])
+    from tests._fixtures import write_mcc
+    write_mcc(world, "region", 0, 0, b"external-payload")
+    snap = repo.snapshot(world, label="x")
+    stats = repo.backfill_region_cache(world, snap)
+    assert stats.skipped_external == 1
+    assert stats.written == 0
+
+
+def test_backfill_handles_missing_mca_gracefully(tmp_path: Path):
+    """If the source archive's layout doesn't match the manifest's regions
+    (e.g. user ran backfill against the wrong folder), don't crash —
+    count the misses and move on."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _mk_world(tmp_path)
+    snap = repo.snapshot(world, label="x")
+
+    empty_world = tmp_path / "empty"
+    empty_world.mkdir()
+    stats = repo.backfill_region_cache(empty_world, snap)
+    assert stats.written == 0
+    assert stats.skipped_missing == 2  # both manifest regions absent in 'empty'
+
+
+def test_snapshot_region_cache_roundtrip_pack_unpack():
+    """Pack/unpack must be inverse — guarding against silent format drift."""
+    from chunkvault.store.repo import _pack_region_cache, _unpack_region_cache
+    from chunkvault.store.manifest import ChunkRecord
+
+    records = [
+        ChunkRecord(cx=0, cz=0, compression=2, timestamp=12345,
+                    content_hash=b"\x01" * 16),
+        ChunkRecord(cx=31, cz=31, compression=130, timestamp=-1,
+                    content_hash=b"\xff" * 16),
+    ]
+    blob = _pack_region_cache(records)
+    out = _unpack_region_cache(blob)
+    assert out == records
+
+
 def test_snapshot_default_excludes_logs_and_session_lock(tmp_path: Path):
     repo = ChunkSnapshotRepo(tmp_path / "repo")
     repo.init()

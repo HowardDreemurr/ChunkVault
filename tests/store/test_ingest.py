@@ -295,6 +295,39 @@ def test_ingest_is_idempotent_on_re_run(tmp_path: Path):
     assert len(repo.list_log_snapshots()) == log_snap_count_after_first
 
 
+def test_re_ingest_backfills_region_cache(tmp_path: Path):
+    """Upgrade scenario: snapshots ingested by an older version of chunkvault
+    have no region_cache rows. Re-selecting the same archive in the wizard
+    should silently backfill the cache from the manifest + extracted .mca
+    bytes, without redoing the chunk-store work."""
+    from chunkvault.store.index import IndexDB
+
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server")
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    ingest_archive(repo, archive)
+    # Simulate an old-version vault: nuke cache rows but keep snapshots.
+    with IndexDB(repo.index_path) as idx:
+        idx._conn.execute("DELETE FROM region_cache")
+        idx._conn.commit()
+        cur = idx._conn.execute("SELECT COUNT(*) FROM region_cache")
+        assert cur.fetchone()[0] == 0
+
+    # Re-ingest the same archive: snapshot is "already_ingested", but the
+    # backfill hook should rebuild the cache.
+    r2 = ingest_archive(repo, archive)
+    assert r2.snapshots == []
+    assert len(r2.already_ingested) == 1
+
+    with IndexDB(repo.index_path) as idx:
+        cur = idx._conn.execute("SELECT COUNT(*) FROM region_cache")
+        assert cur.fetchone()[0] >= 1   # backfilled
+
+
 def test_ingest_handles_bukkit_layout(tmp_path: Path):
     """Bukkit's parallel-worlds layout (world/, world_nether/, world_the_end/
     all directly under the server root) gets snapshotted as one server with

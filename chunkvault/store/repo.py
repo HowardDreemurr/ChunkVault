@@ -89,6 +89,60 @@ DEFAULT_EXCLUDE: tuple[str, ...] = (
 )
 
 
+_REGION_CACHE_FORMAT_V1 = 1
+
+
+def _pack_region_cache(records: list[ChunkRecord]) -> bytes:
+    """Serialize a region's chunk records for the ``region_cache`` table.
+
+    Layout: 1B format-version, 2B chunk-count (big-endian), then per record
+    1B cx + 1B cz + 1B compression + 4B timestamp (signed) + 16B
+    content_hash = 23 bytes/record. Compact — a fully populated 1024-chunk
+    region fits in ~23 KB.
+    """
+    import struct
+    out = bytearray()
+    out.append(_REGION_CACHE_FORMAT_V1)
+    out += struct.pack(">H", len(records))
+    for c in records:
+        if len(c.content_hash) != 16:
+            raise ValueError(
+                f"content_hash must be 16 bytes (got {len(c.content_hash)})"
+            )
+        out += struct.pack(">BBBi", c.cx, c.cz, c.compression, c.timestamp)
+        out += c.content_hash
+    return bytes(out)
+
+
+def _unpack_region_cache(blob: bytes) -> list[ChunkRecord]:
+    """Inverse of :func:`_pack_region_cache`. Raises ValueError on a malformed
+    blob; callers fall back to the slow path."""
+    import struct
+    if len(blob) < 3:
+        raise ValueError("region_cache blob too short")
+    version = blob[0]
+    if version != _REGION_CACHE_FORMAT_V1:
+        raise ValueError(f"unknown region_cache format version: {version}")
+    (count,) = struct.unpack_from(">H", blob, 1)
+    expected = 3 + count * 23
+    if len(blob) != expected:
+        raise ValueError(
+            f"region_cache blob size {len(blob)} != expected {expected} "
+            f"for {count} chunks"
+        )
+    out: list[ChunkRecord] = []
+    off = 3
+    for _ in range(count):
+        cx, cz, compression, timestamp = struct.unpack_from(">BBBi", blob, off)
+        off += 7
+        out.append(ChunkRecord(
+            cx=cx, cz=cz, compression=compression, timestamp=timestamp,
+            content_hash=blob[off:off + 16],
+        ))
+        off += 16
+    return out
+
+
 class ChunkRepoError(Exception):
     """Anything that goes wrong in the chunk-store snapshot backend."""
 
@@ -104,6 +158,16 @@ class VerifyReport:
     missing_manifests: int = 0
     orphan_blobs: int = 0
     repaired: int = 0
+
+
+@dataclass
+class BackfillStats:
+    """Counts returned from :meth:`ChunkSnapshotRepo.backfill_region_cache`."""
+    written: int = 0
+    already_cached: int = 0
+    skipped_external: int = 0   # region had external (.mcc) chunks
+    skipped_missing: int = 0    # .mca not present in source world
+    errors: int = 0
 
 
 @dataclass(frozen=True)
@@ -489,7 +553,102 @@ class ChunkSnapshotRepo:
                 raise RoundTripVerificationError(snap_obj, report)
         return snap_obj
 
-    def _snapshot_region(
+    def backfill_region_cache(
+        self,
+        world: Path | str,
+        snapshot: "ChunkSnapshot | str",
+        *,
+        progress_cb: ProgressCallback = None,
+    ) -> "BackfillStats":
+        """Populate ``region_cache`` from an existing snapshot's manifest +
+        the original world tree.
+
+        Used when a user re-ingests an archive that was processed by an older
+        version (no cache entries) — instead of repeating the full snapshot
+        pipeline (parse + hash every chunk), we cheaply hash each .mca's
+        bytes and pair the sha with the manifest's pre-computed chunk
+        records. Roughly: ~30 ms × N regions instead of ~10 s × N regions.
+
+        Skipped: regions whose .mca isn't present in ``world`` (archive
+        layout drift), regions containing external chunks (their fingerprint
+        depends on .mcc bytes too — see ``_snapshot_region``), and entries
+        that already exist in the cache.
+        """
+        world_path = Path(world)
+        snap = snapshot if isinstance(snapshot, ChunkSnapshot) else self.get(snapshot)
+        if snap is None:
+            raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
+        manifest = read_manifest(snap.manifest_path)
+
+        total = sum(len(rs) for rs in manifest.dimensions.values())
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="backfill_region_cache",
+            label=f"{total} regions from {snap.label or snap.id[:12]}",
+            total=total,
+        ))
+
+        stats = BackfillStats()
+        i = 0
+        with IndexDB(self.index_path) as index:
+            for dim_key, regions in manifest.dimensions.items():
+                for region in regions:
+                    i += 1
+                    if any(c.external for c in region.chunks):
+                        stats.skipped_external += 1
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="backfill_region_cache",
+                            label=f"skip(ext) {dim_key}/r.{region.rx}.{region.rz}.mca",
+                            current=i, total=total,
+                        ))
+                        continue
+                    mca_path = world_path.joinpath(
+                        *dim_key.split("/"),
+                        f"r.{region.rx}.{region.rz}.mca",
+                    )
+                    if not mca_path.is_file():
+                        stats.skipped_missing += 1
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="backfill_region_cache",
+                            label=f"skip(absent) {dim_key}/r.{region.rx}.{region.rz}.mca",
+                            current=i, total=total,
+                        ))
+                        continue
+                    try:
+                        region_bytes = mca_path.read_bytes()
+                    except OSError:
+                        stats.skipped_missing += 1
+                        continue
+                    region_sha = hashlib.sha256(region_bytes).digest()
+                    if index.get_region_cache(region_sha) is not None:
+                        stats.already_cached += 1
+                    else:
+                        try:
+                            blob = _pack_region_cache(region.chunks)
+                        except ValueError:
+                            stats.errors += 1
+                            continue
+                        index.put_region_cache(region_sha, blob)
+                        stats.written += 1
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="backfill_region_cache",
+                        label=f"{dim_key}/r.{region.rx}.{region.rz}.mca",
+                        current=i, total=total,
+                    ))
+
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="backfill_region_cache",
+            current=i, total=total,
+            detail={
+                "written": stats.written,
+                "already_cached": stats.already_cached,
+                "skipped_external": stats.skipped_external,
+                "skipped_missing": stats.skipped_missing,
+                "errors": stats.errors,
+            },
+        ))
+        return stats
+
+    def _snapshot_region(  # noqa: C901 — the two fast paths plus a slow path
         self,
         region_path: Path,
         rx: int,
@@ -499,19 +658,77 @@ class ChunkSnapshotRepo:
         *,
         visited_mcc: set[Path],
     ) -> tuple[RegionRecord | None, int]:
-        """Hash + store every chunk in one region. Returns (record, new_chunk_count)."""
+        """Hash + store every chunk in one region. Returns (record, new_chunk_count).
+
+        Two-tier fast path:
+
+        1. **Region-content cache.** Key = sha256(region_bytes). On hit and
+           every cached chunk hash still present in the pool, return the
+           cached records with zero parsing and zero per-chunk hashing.
+           Without this, every snapshot of an unchanged world re-hashes
+           ~1024 chunks per region — for a 50K-region world that's tens of
+           millions of pointless hashes per snapshot.
+
+        2. **Bulk presence probe.** When the region IS new (or cache stale),
+           collapse 1024 individual ``has_chunk`` SELECTs into one
+           ``has_chunks_bulk`` query. ~1000× fewer SQLite round-trips on
+           cold regions.
+
+        Regions with external (.mcc) chunks bypass the region cache because
+        a region's bytes can be unchanged while its referenced .mcc files
+        change — keying by region_sha alone would return stale hashes. They
+        still benefit from the bulk presence probe.
+        """
         try:
-            region = Region(region_path)
+            region_bytes = region_path.read_bytes()
+        except OSError:
+            return None, 0
+        region_sha = hashlib.sha256(region_bytes).digest()
+
+        cached_blob = index.get_region_cache(region_sha)
+        if cached_blob is not None:
+            try:
+                cached_records = _unpack_region_cache(cached_blob)
+            except ValueError:
+                cached_records = None  # corrupt entry — fall through and rebuild
+            if cached_records is not None:
+                cached_hashes = [c.content_hash for c in cached_records]
+                # Cache may outlive its chunks if a gc reclaimed them. Verify
+                # via one bulk lookup; if any are missing, fall through to
+                # the slow path which will re-store them and refresh the row.
+                present = index.has_chunks_bulk(cached_hashes)
+                if all(h in present for h in cached_hashes):
+                    for c in cached_records:
+                        if c.compression & EXTERNAL_FLAG:
+                            world_cx = rx * 32 + c.cx
+                            world_cz = rz * 32 + c.cz
+                            visited_mcc.add(
+                                region_path.parent
+                                / f"c.{world_cx}.{world_cz}.mcc"
+                            )
+                    return RegionRecord(
+                        rx=rx, rz=rz, chunks=cached_records,
+                    ), 0
+
+        try:
+            region = Region.from_bytes(
+                region_bytes, rx=rx, rz=rz, source=region_path.name,
+            )
         except MCAError:
             return None, 0
-        new_count = 0
-        rec = RegionRecord(rx=rx, rz=rz, chunks=[])
         try:
             chunks_iter = list(region.iter_chunks())
         except MCAError:
             return None, 0
+
+        rec = RegionRecord(rx=rx, rz=rz, chunks=[])
+        # Hold (hash, masked_compression, payload) so we can bulk-check all
+        # hashes in one SQLite call before deciding what to write.
+        pending: list[tuple[bytes, int, bytes]] = []
+        has_external = False
         for chunk in chunks_iter:
             if chunk.external:
+                has_external = True
                 world_cx = rx * 32 + chunk.cx
                 world_cz = rz * 32 + chunk.cz
                 mcc_path = region_path.parent / f"c.{world_cx}.{world_cz}.mcc"
@@ -521,22 +738,42 @@ class ChunkSnapshotRepo:
             else:
                 payload = chunk.payload
                 h = hash_chunk(chunk)
-            # Skip the disk write entirely if this hash is already in the index
-            # — saves the bytes-allocation for an existing-chunk fast path.
-            # ref counting happens in bulk after the snapshot walk completes.
-            if not index.has_chunk(h):
-                masked = chunk.compression & ~EXTERNAL_FLAG
-                blob = bytes([masked]) + payload
-                self.chunks.store_chunk(h, blob)
-                index.add_chunks([h])  # presence row; ref_count stays 0 here
-                new_count += 1
+            masked = chunk.compression & ~EXTERNAL_FLAG
+            pending.append((h, masked, payload))
             rec.chunks.append(ChunkRecord(
                 cx=chunk.cx, cz=chunk.cz,
                 compression=chunk.compression,
                 timestamp=chunk.timestamp,
                 content_hash=h,
             ))
-        return rec, new_count
+
+        unique_hashes = list({h for h, _, _ in pending})
+        present = index.has_chunks_bulk(unique_hashes)
+        new_hashes: list[bytes] = []
+        written: set[bytes] = set()
+        for h, masked, payload in pending:
+            if h in present or h in written:
+                continue
+            blob = bytes([masked]) + payload
+            self.chunks.store_chunk(h, blob)
+            new_hashes.append(h)
+            written.add(h)
+        if new_hashes:
+            index.add_chunks(new_hashes)
+
+        # Populate the region cache for next time. Externals would invalidate
+        # the keying scheme (see docstring), so they don't get cached.
+        if not has_external:
+            try:
+                index.put_region_cache(
+                    region_sha, _pack_region_cache(rec.chunks),
+                )
+            except ValueError:
+                # Pack rejected something (e.g. bad hash length). The snapshot
+                # itself is fine; just skip caching this region.
+                pass
+
+        return rec, len(new_hashes)
 
     # ---- enumeration --------------------------------------------------------
 
