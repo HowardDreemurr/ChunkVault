@@ -161,6 +161,58 @@ class VerifyReport:
 
 
 @dataclass
+class RetimePlan:
+    """One snapshot's pending retime in a :meth:`repair_timestamps` plan."""
+    snap_id: str
+    world_name: str
+    old_ts_ms: int
+    new_ts_ms: int
+    old_label: str
+    new_label: str
+
+
+@dataclass
+class DuplicateGroup:
+    """A set of snapshots that should collapse into one after repair."""
+    world_name: str
+    target_ts_ms: int
+    winner_id: str
+    loser_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RepairReport:
+    """Result of :meth:`ChunkSnapshotRepo.repair_timestamps`."""
+    scanned: int = 0
+    already_correct: int = 0
+    no_last_played: list[tuple[str, str]] = field(default_factory=list)  # (id, label)
+    unreadable: list[tuple[str, str]] = field(default_factory=list)      # (id, error)
+    to_retime: list[RetimePlan] = field(default_factory=list)
+    duplicate_groups: list[DuplicateGroup] = field(default_factory=list)
+    to_delete: list[tuple[str, str]] = field(default_factory=list)        # (id, label)
+    # Populated when dry_run=False:
+    applied: bool = False
+    deleted: list[str] = field(default_factory=list)
+    retimed: list[str] = field(default_factory=list)
+    errors: list[tuple[str, str, str]] = field(default_factory=list)      # (op, id, msg)
+
+    def summary(self) -> str:
+        verdict = (
+            "APPLIED" if self.applied else
+            ("CLEAN" if not (self.to_retime or self.to_delete) else "DRY-RUN")
+        )
+        return (
+            f"{verdict}  scanned={self.scanned}, correct={self.already_correct}, "
+            f"need_retime={len(self.to_retime)}, "
+            f"duplicate_groups={len(self.duplicate_groups)}, "
+            f"to_delete={len(self.to_delete)}, "
+            f"no_last_played={len(self.no_last_played)}, "
+            f"unreadable={len(self.unreadable)}, "
+            f"errors={len(self.errors)}"
+        )
+
+
+@dataclass
 class BackfillStats:
     """Counts returned from :meth:`ChunkSnapshotRepo.backfill_region_cache`."""
     written: int = 0
@@ -1640,6 +1692,208 @@ class ChunkSnapshotRepo:
         new_ts = datetime.fromtimestamp(lp_ms / 1000, tz=timezone.utc)
         updated = self.retime_snapshot(snap, new_ts)
         return updated, "last_played"
+
+    def repair_timestamps(
+        self, *,
+        dry_run: bool = True,
+        progress_cb: ProgressCallback = None,
+    ) -> "RepairReport":
+        """Walk every snapshot and align ``timestamp_ms`` with
+        ``manifest.last_played_ms`` (level.dat's authoritative time).
+
+        Solves the historical bug where ``ingest_archive`` would fall back to
+        ``datetime.now()`` when a filename didn't match its time-stamp regex,
+        producing wrong-timestamped snapshots whose labels also embedded the
+        wrong time. The fix data is on disk: the manifest header's
+        ``last_played_ms`` was always read correctly from level.dat at
+        snapshot time, so we don't need the source archive in hand.
+
+        Stages (computed first, applied second):
+
+        1. Group snapshots by ``(world_name, last_played_ms)`` for entries
+           where ``last_played_ms > 0`` and differs from current
+           ``timestamp_ms``. Multiple snapshots in a group are *duplicates*
+           (created by repeated ingest of the same archive under different
+           wrong fallback timestamps).
+        2. For each duplicate group: pick a winner (prefer one whose current
+           ``timestamp_ms`` already matches ``last_played_ms``; ties broken
+           by id-string sort), mark losers for deletion.
+        3. For each surviving snapshot whose timestamp is wrong: retime to
+           ``last_played_ms``, and if its label follows the
+           ``<world_name>-<YYYY-MM-DD-HH-MM-SS>`` ingest pattern, update
+           the label to match.
+
+        With ``dry_run=True`` (default), nothing is written — only a report
+        is produced. ``dry_run=False`` applies the plan in dependency order
+        (delete losers first so retimes don't collide).
+        """
+        report = RepairReport()
+        all_snaps = self.list()
+        report.scanned = len(all_snaps)
+
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="repair_scan",
+            label=f"reading {len(all_snaps)} manifests",
+            total=len(all_snaps),
+        ))
+
+        # Per-snapshot state: (snap, current_ts_ms, target_ts_ms_or_None)
+        plans: list[tuple[ChunkSnapshot, int, int | None]] = []
+        for i, snap in enumerate(all_snaps, 1):
+            try:
+                manifest = read_manifest(snap.manifest_path)
+            except Exception as e:
+                report.unreadable.append((snap.id, str(e)))
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="repair_scan",
+                    current=i, total=len(all_snaps),
+                ))
+                continue
+            current_ts_ms = manifest.header.timestamp_ms
+            lp_ms = manifest.header.last_played_ms
+            if not lp_ms:
+                report.no_last_played.append((snap.id, snap.label or ""))
+                plans.append((snap, current_ts_ms, None))
+            else:
+                plans.append((snap, current_ts_ms, lp_ms))
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_progress", phase="repair_scan",
+                current=i, total=len(all_snaps),
+            ))
+
+        # Group by (world_name, target_ts_ms) for those that have a target.
+        groups: dict[tuple[str, int], list[tuple[ChunkSnapshot, int]]] = {}
+        for snap, cur_ts, target in plans:
+            if target is None:
+                continue
+            groups.setdefault((snap.world_name, target), []).append((snap, cur_ts))
+
+        # Decide winner per group, mark losers for deletion.
+        delete_ids: set[str] = set()
+        for (world_name, target_ts), members in groups.items():
+            if len(members) <= 1:
+                continue
+            # Prefer the one whose current ts already matches target (i.e.,
+            # it's correctly placed); ties broken by id-string sort for
+            # determinism.
+            members_sorted = sorted(
+                members,
+                key=lambda m: (m[1] != target_ts, m[0].id),
+            )
+            winner = members_sorted[0][0]
+            losers = [m[0] for m in members_sorted[1:]]
+            report.duplicate_groups.append(DuplicateGroup(
+                world_name=world_name,
+                target_ts_ms=target_ts,
+                winner_id=winner.id,
+                loser_ids=[l.id for l in losers],
+            ))
+            for loser in losers:
+                delete_ids.add(loser.id)
+                report.to_delete.append((loser.id, loser.label or ""))
+
+        # Compute retime plan for surviving snapshots.
+        for snap, cur_ts, target in plans:
+            if snap.id in delete_ids or target is None:
+                continue
+            if cur_ts == target:
+                report.already_correct += 1
+                continue
+            old_label = snap.label or ""
+            new_label = self._maybe_retitle_label(
+                old_label, snap.world_name, cur_ts, target,
+            )
+            report.to_retime.append(RetimePlan(
+                snap_id=snap.id,
+                world_name=snap.world_name,
+                old_ts_ms=cur_ts,
+                new_ts_ms=target,
+                old_label=old_label,
+                new_label=new_label,
+            ))
+
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="repair_scan",
+            current=len(all_snaps), total=len(all_snaps),
+        ))
+
+        if dry_run:
+            return report
+
+        # Apply: delete losers FIRST so retimes don't run into label/ts
+        # collisions with snapshots that are about to disappear anyway.
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="repair_apply",
+            label=f"deleting {len(report.to_delete)} duplicates "
+                  f"+ retiming {len(report.to_retime)}",
+            total=len(report.to_delete) + len(report.to_retime),
+        ))
+        applied = 0
+        for snap_id, _label in report.to_delete:
+            try:
+                self.delete(snap_id)
+                report.deleted.append(snap_id)
+            except Exception as e:
+                report.errors.append(("delete", snap_id, str(e)))
+            applied += 1
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_progress", phase="repair_apply",
+                current=applied,
+            ))
+        for plan in report.to_retime:
+            try:
+                new_ts = datetime.fromtimestamp(
+                    plan.new_ts_ms / 1000, tz=timezone.utc,
+                )
+                self.retime_snapshot(plan.snap_id, new_ts)
+                if plan.new_label != plan.old_label:
+                    self._rename_snapshot_label(plan.snap_id, plan.new_label)
+                report.retimed.append(plan.snap_id)
+            except Exception as e:
+                report.errors.append(("retime", plan.snap_id, str(e)))
+            applied += 1
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_progress", phase="repair_apply",
+                current=applied,
+            ))
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="repair_apply",
+            current=applied,
+        ))
+
+        report.applied = True
+        return report
+
+    def _maybe_retitle_label(
+        self, old_label: str, world_name: str,
+        old_ts_ms: int, new_ts_ms: int,
+    ) -> str:
+        """If ``old_label`` looks like the ingest-generated
+        ``<world>-<YYYY-MM-DD-HH-MM-SS>`` pattern with the OLD timestamp,
+        return a new label with the NEW timestamp. Otherwise return
+        ``old_label`` unchanged — user-chosen labels are not auto-renamed.
+        """
+        if not old_label:
+            return old_label
+        old_ts = datetime.fromtimestamp(old_ts_ms / 1000, tz=timezone.utc)
+        expected = f"{world_name}-{old_ts.strftime('%Y-%m-%d-%H-%M-%S')}"
+        if old_label != expected:
+            return old_label
+        new_ts = datetime.fromtimestamp(new_ts_ms / 1000, tz=timezone.utc)
+        return f"{world_name}-{new_ts.strftime('%Y-%m-%d-%H-%M-%S')}"
+
+    def _rename_snapshot_label(self, snap_id: str, new_label: str) -> None:
+        """Persist a label rename to both the manifest header and the index
+        row. Run AFTER ``retime_snapshot`` (which already touches the
+        manifest, so this is a small follow-up write)."""
+        snap = self.get(snap_id)
+        if snap is None:
+            raise ChunkRepoError(f"snapshot vanished mid-repair: {snap_id}")
+        manifest = read_manifest(snap.manifest_path)
+        manifest.header.label = new_label
+        write_manifest(snap.manifest_path, manifest)
+        with IndexDB(self.index_path) as index:
+            index.update_snapshot_label(snap_id, new_label)
 
     # ---- delete -------------------------------------------------------------
 

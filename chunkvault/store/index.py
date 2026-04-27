@@ -208,6 +208,17 @@ class IndexDB:
                 )
             return cur.rowcount > 0
 
+    def update_snapshot_label(self, snap_id: str, new_label: str) -> bool:
+        """Update a snapshot row's label. Used by repair-timestamps when a
+        retime invalidates the label (labels embed the timestamp by
+        convention)."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE snapshots SET label = ? WHERE id = ?",
+                (new_label, snap_id),
+            )
+            return cur.rowcount > 0
+
     def find_snapshot_by_label_and_timestamp(
         self, label: str, timestamp_ms: int,
     ) -> str | None:

@@ -593,6 +593,75 @@ def cmd_retime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repair_timestamps(args: argparse.Namespace) -> int:
+    """Repair snapshot timestamps using level.dat's LastPlayed (recorded in
+    each manifest header) as the authoritative source.
+
+    Handles the historical bug where ingest_archive would use
+    ``datetime.now()`` when an archive filename didn't match the time-stamp
+    regex — producing wrong-timestamped snapshots whose labels embedded the
+    wrong time, which broke idempotency and produced duplicates on re-ingest.
+
+    Default mode: dry-run. Prints what would change. Add ``--apply`` to
+    actually delete duplicates and retime survivors.
+    """
+    from datetime import datetime, timezone
+    from .store import ChunkSnapshotRepo
+    repo = ChunkSnapshotRepo(args.repo)
+    report = repo.repair_timestamps(dry_run=not args.apply)
+    print(report.summary())
+    if report.no_last_played:
+        print(f"\n# {len(report.no_last_played)} snapshot(s) have no "
+              f"LastPlayed in manifest — cannot auto-fix:")
+        for sid, label in report.no_last_played[:20]:
+            print(f"  {sid[:12]}  {label or '-'}")
+        if len(report.no_last_played) > 20:
+            print(f"  ... ({len(report.no_last_played) - 20} more)")
+    if report.unreadable:
+        print(f"\n# {len(report.unreadable)} manifest(s) unreadable:",
+              file=sys.stderr)
+        for sid, err in report.unreadable[:10]:
+            print(f"  {sid[:12]}: {err}", file=sys.stderr)
+    if report.duplicate_groups:
+        print(f"\n# {len(report.duplicate_groups)} duplicate group(s):")
+        for g in report.duplicate_groups[:20]:
+            ts = datetime.fromtimestamp(
+                g.target_ts_ms / 1000, tz=timezone.utc,
+            ).isoformat()
+            print(f"  {g.world_name} @ {ts}")
+            print(f"    keep:   {g.winner_id[:12]}")
+            for lid in g.loser_ids:
+                print(f"    delete: {lid[:12]}")
+        if len(report.duplicate_groups) > 20:
+            print(f"  ... ({len(report.duplicate_groups) - 20} more groups)")
+    if report.to_retime:
+        verb = "retimed" if report.applied else "would retime"
+        print(f"\n# {verb} {len(report.to_retime)} snapshot(s) "
+              f"(showing first 20):")
+        for plan in report.to_retime[:20]:
+            old_iso = datetime.fromtimestamp(
+                plan.old_ts_ms / 1000, tz=timezone.utc,
+            ).isoformat()
+            new_iso = datetime.fromtimestamp(
+                plan.new_ts_ms / 1000, tz=timezone.utc,
+            ).isoformat()
+            label_part = (
+                f"  label: {plan.old_label!r} → {plan.new_label!r}"
+                if plan.new_label != plan.old_label else ""
+            )
+            print(f"  {plan.snap_id[:12]}  {old_iso} → {new_iso}{label_part}")
+        if len(report.to_retime) > 20:
+            print(f"  ... ({len(report.to_retime) - 20} more)")
+    if report.errors:
+        print(f"\n# {len(report.errors)} error(s):", file=sys.stderr)
+        for op, sid, msg in report.errors[:20]:
+            print(f"  [{op}] {sid[:12]}: {msg}", file=sys.stderr)
+    if not args.apply and (report.to_retime or report.to_delete):
+        print(f"\n# this was a DRY RUN — re-run with --apply to "
+              f"actually modify the vault.")
+    return 0 if not report.errors else 1
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     repo = _open_repo(args)
     for snap in repo.list():
@@ -819,6 +888,21 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--dry-run", action="store_true",
                     help="Report what would change without writing anything.")
     rt.set_defaults(func=cmd_retime)
+
+    rp = sub.add_parser(
+        "repair-timestamps",
+        help="Vault-wide repair: align every snapshot's timestamp+label "
+             "with its manifest's level.dat LastPlayed. Detects and dedupes "
+             "duplicate snapshots created by the historical fallback-to-now "
+             "ingest bug. Default is dry-run; pass --apply to modify.",
+    )
+    rp.add_argument("repo", type=Path)
+    rp.add_argument(
+        "--apply", action="store_true",
+        help="Actually delete duplicates and retime survivors. Without "
+             "this flag, only a report is printed (DRY RUN).",
+    )
+    rp.set_defaults(func=cmd_repair_timestamps)
 
     ll = sub.add_parser("logs-list", help="List log snapshots.")
     ll.add_argument("repo", type=Path)
