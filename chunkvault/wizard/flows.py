@@ -19,6 +19,7 @@ from ..store import (
 )
 from ..store.ingest import IngestResult
 from .detect import EnvironmentSummary, detect_environment, summarize_repo
+from .i18n import t
 from .ui import (
     choose_one,
     confirm,
@@ -153,8 +154,9 @@ def run_wizard(console: Console | None = None) -> int:
 
 def _pick_snapshot(
     console: Console, repo: ChunkSnapshotRepo, *,
-    prompt: str = "Pick a snapshot",
+    prompt: str | None = None,
 ):
+    prompt = prompt if prompt is not None else t("prompt.pick_snapshot")
     """Show all snapshots in the vault and let the user pick one.
 
     Returns the ChunkSnapshot, or None if the vault is empty / user
@@ -163,7 +165,7 @@ def _pick_snapshot(
     """
     snaps = repo.list()
     if not snaps:
-        console.print("[yellow]vault has no snapshots yet.[/yellow]")
+        console.print(f"[yellow]{t('msg.empty_vault')}[/yellow]")
         return None
     options = [
         f"{s.short_id}  {s.timestamp.isoformat()}  {(s.label or '-')[:40]}"
@@ -178,12 +180,13 @@ def _pick_snapshot(
 
 def _pick_log_snapshot(
     console: Console, repo: ChunkSnapshotRepo, *,
-    prompt: str = "Pick a log snapshot",
+    prompt: str | None = None,
 ):
     """Same as :func:`_pick_snapshot` but for log snapshots."""
+    prompt = prompt if prompt is not None else t("prompt.pick_log_snapshot")
     snaps = repo.list_log_snapshots()
     if not snaps:
-        console.print("[yellow]vault has no log snapshots.[/yellow]")
+        console.print(f"[yellow]{t('msg.empty_log_snaps')}[/yellow]")
         return None
     options = [
         f"{s.short_id}  {s.timestamp.isoformat()}  {(s.label or '-'):26}  "
@@ -200,13 +203,13 @@ def _pick_log_snapshot(
 def _pick_or_create_repo(console: Console, env: EnvironmentSummary) -> ChunkSnapshotRepo:
     chunk_repos = [r for r in env.repos if r.kind == "chunk"]
     default = chunk_repos[0].path if chunk_repos else (Path.cwd() / "backup-repo")
-    repo_path = prompt_path(console, "Repo path", default=default)
+    repo_path = prompt_path(console, t("prompt.repo_path"), default=default)
     repo = ChunkSnapshotRepo(repo_path)
     if not repo.is_initialized():
-        if not confirm(console, f"Create new repo at {repo_path}?", default=True):
-            raise RuntimeError("aborted: repo not initialized")
+        if not confirm(console, t("prompt.create_repo", path=repo_path), default=True):
+            raise RuntimeError(t("msg.aborted_repo_not_initialized"))
         repo.init()
-        console.print(f"[green]initialized[/green] {repo_path}")
+        console.print(f"[green]{t('msg.initialized_at', path=repo_path)}[/green]")
     return repo
 
 
@@ -217,30 +220,30 @@ def run_ingest_flow(
 ) -> list[IngestResult]:
     """Bulk-import backup archives — the user's main use case."""
     render_op_intro(
-        console, "Ingest archives",
-        "Bulk-import backup .zip / .tar.gz files. The wizard scans the "
-        "source folder(s) you give it, peeks inside each archive to "
-        "detect server folders + worlds + logs, shows you a preview, "
-        "then asks confirm before doing anything.",
-        expects="A folder containing backup archive files.",
-        example="D:\\day_backups\\  (with files like 2024-08-15-...zip inside)",
+        console, t("flow.ingest.title"),
+        t("flow.ingest.body"),
+        expects=t("flow.ingest.expects"),
+        example=t("flow.ingest.example"),
     )
     repo = _pick_or_create_repo(console, env)
 
     # Collect candidate source paths
     candidates: list[Path] = []
     for s in env.source_paths:
-        if confirm(console, f"Use source path {s.path} ({s.archive_count} archives)?",
-                   default=True):
+        if confirm(
+            console,
+            t("prompt.use_source", path=s.path, count=s.archive_count),
+            default=True,
+        ):
             candidates.append(s.path)
     while True:
-        if confirm(console, "Add another source path?", default=False):
-            extra = prompt_path(console, "Extra source", must_exist=True)
+        if confirm(console, t("prompt.add_source"), default=False):
+            extra = prompt_path(console, t("prompt.extra_source"), must_exist=True)
             candidates.append(extra)
         else:
             break
     if not candidates:
-        console.print("[yellow]no source paths chosen — nothing to do.[/yellow]")
+        console.print(f"[yellow]{t('msg.no_source_paths')}[/yellow]")
         return []
 
     # Enumerate archives
@@ -248,25 +251,16 @@ def run_ingest_flow(
     for c in candidates:
         archives.extend(iter_archives(c))
     if not archives:
-        console.print("[yellow]no archives found in chosen sources.[/yellow]")
+        console.print(f"[yellow]{t('msg.no_archives')}[/yellow]")
         return []
 
-    skip_logs = not confirm(
-        console, "Capture logs into the repo (deduped)?", default=True,
-    )
-    verify_after = confirm(
-        console,
-        "Round-trip verify each snapshot? (slower but proves restorability)",
-        default=True,
-    )
+    skip_logs = not confirm(console, t("prompt.capture_logs"), default=True)
+    verify_after = confirm(console, t("prompt.verify_each"), default=True)
     if not verify_after:
-        console.print(
-            "[yellow]Heads up:[/yellow] verification skipped — you can run "
-            "[bold]chunkvault verify-roundtrip[/bold] later for spot checks."
-        )
+        console.print(f"[yellow]{t('msg.verification_skipped')}[/yellow]")
 
     # Inspect each archive — show servers, regions, logs INSIDE, not just file size.
-    console.print(f"\n[bold]inspecting {len(archives)} archive(s)…[/bold]")
+    console.print(f"\n[bold]{t('msg.inspecting_count', count=len(archives))}[/bold]")
     from ..store import preview_archive
     from .ui import render_archive_preview
     previews = []
@@ -279,10 +273,7 @@ def run_ingest_flow(
         previews.append(prev)
         render_archive_preview(console, prev, compact=use_compact)
     if use_compact:
-        console.print(
-            "[dim](compact view — pick [c]ompact-off below to see full per-archive "
-            "tables, or accept defaults to ingest each ✓ archive.)[/dim]"
-        )
+        console.print(f"[dim]{t('msg.compact_view_hint')}[/dim]")
 
     # Aggregate totals across all previews
     total_servers = sum(len(p.servers) for p in previews if p.error is None)
@@ -295,14 +286,14 @@ def run_ingest_flow(
                             for s in p.servers)
     failed = [p for p in previews if p.error is not None]
     console.print(
-        f"\n[bold]TOTAL across {len(archives)} archive(s):[/bold]\n"
-        f"  servers: {total_servers}\n"
-        f"  region files (world chunks): {total_regions}\n"
-        f"  log/crash files: {total_logs}\n"
-        f"  estimated world bytes: {fmt_bytes(total_world_bytes)}"
+        f"\n[bold]{t('msg.total_across_archives', count=len(archives))}[/bold]\n"
+        f"{t('msg.total.servers', n=total_servers)}\n"
+        f"{t('msg.total.regions', n=total_regions)}\n"
+        f"{t('msg.total.logs', n=total_logs)}\n"
+        f"{t('msg.total.world_bytes', n=fmt_bytes(total_world_bytes))}"
     )
     if failed:
-        console.print(f"  [red]{len(failed)} unreadable archive(s) — will be skipped[/red]")
+        console.print(f"  [red]{t('msg.total.unreadable', n=len(failed))}[/red]")
 
     # Per-archive selection: user can uncheck individual archives instead of
     # the all-or-nothing Proceed? prompt. Pre-checks "clean" archives (every
@@ -310,13 +301,11 @@ def run_ingest_flow(
     # require an explicit decision.
     selected = select_archives(archives, previews)
     if not selected:
-        console.print("[yellow]nothing selected — cancelled.[/yellow]")
+        console.print(f"[yellow]{t('msg.nothing_selected')}[/yellow]")
         return []
     selected_set = {a for a in selected}
     archives = [a for a in archives if a in selected_set]
-    console.print(
-        f"[dim]ingesting {len(archives)} archive(s)…[/dim]"
-    )
+    console.print(f"[dim]{t('msg.ingesting_count', count=len(archives))}[/dim]")
 
     results: list[IngestResult] = []
     verify_failures: list[tuple[str, str]] = []     # (archive_name, reason)
@@ -366,19 +355,13 @@ def run_ingest_flow(
     log_snaps = sum(1 for r in results if r.log_snapshot is not None)
     already = sum(len(r.already_ingested) for r in results)
     console.print(
-        f"\n[green]done.[/green] {snaps} new world snapshots, "
-        f"{log_snaps} log snapshots, "
-        f"{len(results)}/{len(archives)} archives processed cleanly."
+        f"\n[green]{t('msg.done_summary', snaps=snaps, logs=log_snaps, clean=len(results), total=len(archives))}[/green]"
     )
     if already:
-        console.print(
-            f"[dim]{already} server(s) already in the vault — skipped "
-            f"(re-ingest is idempotent).[/dim]"
-        )
+        console.print(f"[dim]{t('msg.already_in_vault', count=already)}[/dim]")
     if verify_failures:
         console.print(
-            f"[red]{len(verify_failures)} archive(s) failed round-trip verify "
-            f"— their snapshots are kept but should be inspected:[/red]"
+            f"[red]{t('msg.verify_failed_count', count=len(verify_failures))}[/red]"
         )
         for name, summary in verify_failures[:10]:
             console.print(f"  {name}: {summary}")
@@ -389,26 +372,16 @@ def run_ingest_flow(
 
 def run_snapshot_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
-        console, "Snapshot a live world",
-        "Take a snapshot of one specific MC world directory. Don't pick "
-        "this for archive folders — use [bold]Ingest archives[/bold] for "
-        ".zip files. The directory you give must contain "
-        "[yellow]level.dat[/yellow] or a [yellow]region/[/yellow] "
-        "subdirectory; the wizard will refuse if it doesn't look like a "
-        "real world (so a typo doesn't burn 80 GB of garbage into the vault).",
-        expects="A single MC world/ directory (containing level.dat or region/).",
-        example="D:\\servers\\smp\\world  (NOT D:\\servers\\smp — point at the world subdir)",
+        console, t("flow.snapshot.title"),
+        t("flow.snapshot.body"),
+        expects=t("flow.snapshot.expects"),
+        example=t("flow.snapshot.example"),
     )
     repo = _pick_or_create_repo(console, env)
-    world = prompt_path(console, "World directory (must contain level.dat or region/)",
-                        must_exist=True)
-    label = console.input("Label (blank for none): ").strip() or None
-    allow_live = confirm(console, "Allow snapshotting a live world?", default=False)
-    verify_after = confirm(
-        console,
-        "Round-trip verify after snapshot? (slower but proves restorability)",
-        default=True,
-    )
+    world = prompt_path(console, t("prompt.world_dir"), must_exist=True)
+    label = console.input(t("prompt.label_blank")).strip() or None
+    allow_live = confirm(console, t("prompt.allow_live"), default=False)
+    verify_after = confirm(console, t("prompt.verify_after"), default=True)
     progress = make_progress(console)
     from ..store.repo import RoundTripVerificationError
     with progress:
@@ -420,53 +393,44 @@ def run_snapshot_flow(console: Console, env: EnvironmentSummary):
                                  progress_cb=cb, verify_roundtrip=verify_after)
         except RoundTripVerificationError as e:
             console.print(
-                f"[red]VERIFY FAILED[/red] for {e.snapshot.short_id} "
-                f"(label={e.snapshot.label!r}):"
+                f"[red]{t('msg.snap_verify_failed', sid=e.snapshot.short_id, label=e.snapshot.label or '-')}[/red]"
             )
             console.print(f"  {e.report.summary()}")
-            console.print(
-                "[yellow]Snapshot was kept in the index — inspect it or "
-                "remove it explicitly.[/yellow]"
-            )
+            console.print(f"[yellow]{t('msg.snap_kept_inspect')}[/yellow]")
             return
-    console.print(f"[green]snapshot[/green] {snap.short_id}  {snap.label or ''}  "
-                  f"mc={snap.mc_version or '?'}"
-                  + ("  [dim](verified)[/dim]" if verify_after else ""))
+    if verify_after:
+        console.print(f"[green]{t('msg.snap_done_verified', sid=snap.short_id, label=snap.label or '-', ver=snap.mc_version or '?')}[/green]")
+    else:
+        console.print(f"[green]{t('msg.snap_done', sid=snap.short_id, label=snap.label or '-', ver=snap.mc_version or '?')}[/green]")
 
 
 # ---- diff ---------------------------------------------------------------
 
 def run_diff_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
-        console, "Diff snapshots",
-        "Compare any two snapshots already in the vault. Pure manifest "
-        "lookup, no disk I/O — completes in milliseconds regardless of "
-        "world size. Reports added / modified / removed chunks per "
-        "dimension and (for cross-version snapshots) the MC version delta.",
-        expects="Two snapshot identifiers (label or short id) from the same vault.",
+        console, t("flow.diff.title"),
+        t("flow.diff.body"),
+        expects=t("flow.diff.expects"),
     )
     repo = _pick_or_create_repo(console, env)
     snaps = repo.list()
     if len(snaps) < 2:
-        console.print("[yellow]need at least 2 snapshots to diff.[/yellow]")
+        console.print(f"[yellow]{t('msg.need_two_snaps')}[/yellow]")
         return
-    console.print("\n[bold]snapshots:[/bold]")
+    console.print(f"\n[bold]{t('msg.snapshots_header')}[/bold]")
     for s in snaps[:20]:
         console.print(f"  {s.short_id}  {s.timestamp.isoformat()}  "
                       f"{s.label or '-':25}  ({s.world_name})")
-    a = console.input("Snap A (label or short id): ").strip()
-    b = console.input("Snap B (label or short id): ").strip()
+    a = console.input(t("prompt.snap_a")).strip()
+    b = console.input(t("prompt.snap_b")).strip()
     diff = repo.diff_snapshots(a, b)
     counts = diff.count_by_kind()
     console.print(
-        f"\n[bold]{a}[/bold] → [bold]{b}[/bold]: "
-        f"+{counts['added']} ~{counts['modified']} -{counts['removed']}  "
-        f"({len(diff.changes)} chunks)"
+        f"\n[bold]{t('msg.diff.summary', a=a, b=b, added=counts['added'], modified=counts['modified'], removed=counts['removed'], total=len(diff.changes))}[/bold]"
     )
     if diff.version_changed():
         console.print(
-            f"  [yellow]version change:[/yellow] "
-            f"{diff.old_mc_version} → {diff.new_mc_version}"
+            f"  [yellow]{t('msg.diff.version_change', old=diff.old_mc_version, new=diff.new_mc_version)}[/yellow]"
         )
 
 
@@ -474,22 +438,21 @@ def run_diff_flow(console: Console, env: EnvironmentSummary):
 
 def run_list_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
-        console, "List snapshots",
-        "Show every world snapshot and log snapshot currently in the "
-        "vault, newest first.",
-        expects="Just the vault path — no source data needed.",
+        console, t("flow.list.title"),
+        t("flow.list.body"),
+        expects=t("flow.list.expects"),
     )
     repo = _pick_or_create_repo(console, env)
     snaps = repo.list()
     log_snaps = repo.list_log_snapshots()
-    console.print(f"\n[bold]world snapshots ({len(snaps)}):[/bold]")
+    console.print(f"\n[bold]{t('msg.world_snaps_header', count=len(snaps))}[/bold]")
     for s in snaps[:50]:
         console.print(f"  {s.short_id}  {s.timestamp.isoformat()}  "
                       f"{s.label or '-':25}  world={s.world_name}  "
                       f"mc={s.mc_version or '?'}")
     if len(snaps) > 50:
-        console.print(f"  … (+{len(snaps) - 50} more)")
-    console.print(f"\n[bold]log snapshots ({len(log_snaps)}):[/bold]")
+        console.print(t("msg.more_snaps", n=len(snaps) - 50))
+    console.print(f"\n[bold]{t('msg.log_snaps_header', count=len(log_snaps))}[/bold]")
     for s in log_snaps[:50]:
         console.print(f"  {s.short_id}  {s.timestamp.isoformat()}  "
                       f"{s.label or '-':25}  servers={s.server_count}  "
@@ -500,66 +463,55 @@ def run_list_flow(console: Console, env: EnvironmentSummary):
 
 def run_verify_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
-        console, "Verify integrity",
-        "Walk every blob in the vault and re-hash it; flag any blob "
-        "whose contents don't match its file name (= silent disk bit-rot). "
-        "Also cross-checks that every chunk referenced by a manifest "
-        "actually exists on disk. Slow (proportional to vault size) but "
-        "the gold standard for 'is my backup still healthy?'.",
-        expects="Just the vault path.",
+        console, t("flow.verify.title"),
+        t("flow.verify.body"),
+        expects=t("flow.verify.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    repair = confirm(console, "Repair (delete) corrupt blobs?", default=False)
+    repair = confirm(console, t("prompt.repair_blobs"), default=False)
     progress = make_progress(console)
     with progress:
         task = progress.add_task("verify: idle", total=None)
         cb = _make_phase_cb(progress, task, prefix="verify")
         report = repo.verify(repair=repair, progress_cb=cb)
-    console.print(
-        f"chunks: ok={report.ok_chunks} corrupt={report.corrupt_chunks}\n"
-        f"files:  ok={report.ok_files} corrupt={report.corrupt_files}\n"
-        f"missing-referenced: {report.missing_referenced}\n"
-        f"orphan blobs (gc to reclaim): {report.orphan_blobs}\n"
-        f"repaired: {report.repaired}"
-    )
+    console.print(t(
+        "msg.verify.report",
+        ok_c=report.ok_chunks, cc=report.corrupt_chunks,
+        ok_f=report.ok_files, cf=report.corrupt_files,
+        miss=report.missing_referenced,
+        orph=report.orphan_blobs,
+        rep=report.repaired,
+    ))
 
 
 # ---- gc -----------------------------------------------------------------
 
 def run_gc_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
-        console, "Garbage-collect",
-        "Reclaim disk space from blobs that no remaining snapshot "
-        "references. Run this after [bold]Delete[/bold] (CLI only — "
-        "wizard doesn't let you delete) or after fsck removes orphan "
-        "manifests.",
-        expects="Just the vault path.",
+        console, t("flow.gc.title"),
+        t("flow.gc.body"),
+        expects=t("flow.gc.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    if not confirm(console, "Run gc now?", default=True):
+    if not confirm(console, t("prompt.run_gc_now"), default=True):
         return
     result = repo.gc()
     console.print(
-        f"[green]gc done[/green]  "
-        f"chunks={result.chunks} files={result.files} logs={result.logs}"
+        f"[green]{t('msg.gc.done', c=result.chunks, f=result.files, l=result.logs)}[/green]"
     )
 
 
 def run_fsck_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
-        console, "Fsck (repair)",
-        "Reconcile the vault's on-disk state with the index. Fixes "
-        "half-written snapshots left behind by Ctrl-C / kill / power-loss: "
-        "deletes orphan manifests, reverses dangling refs, removes "
-        "stray .tmp files. Idempotent and safe to run any time.",
-        expects="Just the vault path.",
+        console, t("flow.fsck.title"),
+        t("flow.fsck.body"),
+        expects=t("flow.fsck.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    dry_run = confirm(console, "Dry-run only (just report, don't fix)?",
-                      default=False)
+    dry_run = confirm(console, t("prompt.fsck_dryrun"), default=False)
     report = repo.fsck(repair=not dry_run)
     if report.clean:
-        console.print("[green]fsck: clean — no issues found[/green]")
+        console.print(f"[green]{t('msg.fsck.clean')}[/green]")
         return
     console.print(f"[yellow]{report.summary()}[/yellow]")
     for path in report.orphan_manifests[:10]:
@@ -576,13 +528,9 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
     from datetime import datetime, timezone
 
     render_op_intro(
-        console, "Repair timestamps",
-        "Align every snapshot's timestamp + label with its manifest's "
-        "level.dat LastPlayed (the authoritative save time). Detects and "
-        "dedupes snapshots created by the historical fallback-to-now() "
-        "ingest bug. Always shows a dry-run plan first; you confirm "
-        "before anything is modified.",
-        expects="Just the vault path.",
+        console, t("flow.repair_ts.title"),
+        t("flow.repair_ts.body"),
+        expects=t("flow.repair_ts.expects"),
     )
     repo = _pick_or_create_repo(console, env)
 
@@ -598,9 +546,7 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
 
     if dry.no_last_played:
         console.print(
-            f"[yellow]{len(dry.no_last_played)} snapshot(s) lack LastPlayed "
-            f"in their manifest — these can NOT be auto-repaired and will "
-            f"be left alone:[/yellow]"
+            f"[yellow]{t('flow.repair_ts.no_lp_warning', count=len(dry.no_last_played))}[/yellow]"
         )
         for sid, label in dry.no_last_played[:10]:
             console.print(f"  {sid[:12]}  {label or '-'}")
@@ -609,33 +555,30 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
 
     if dry.unreadable:
         console.print(
-            f"[red]{len(dry.unreadable)} manifest(s) unreadable:[/red]"
+            f"[red]{t('flow.repair_ts.unreadable_warning', count=len(dry.unreadable))}[/red]"
         )
         for sid, err in dry.unreadable[:5]:
             console.print(f"  {sid[:12]}: {err}")
 
     if dry.duplicate_groups:
         console.print(
-            f"\n[bold]{len(dry.duplicate_groups)} duplicate group(s)[/bold] "
-            f"(snapshots that should collapse into one):"
+            f"\n[bold]{t('flow.repair_ts.dup_groups_header', count=len(dry.duplicate_groups))}[/bold]"
         )
         for g in dry.duplicate_groups[:10]:
             ts_iso = datetime.fromtimestamp(
                 g.target_ts_ms / 1000, tz=timezone.utc,
             ).isoformat()
             console.print(f"  [cyan]{g.world_name}[/cyan] @ {ts_iso}")
-            console.print(f"    keep:   {g.winner_id[:12]}")
+            console.print(t("flow.repair_ts.dup_keep", sid=g.winner_id[:12]))
             for lid in g.loser_ids:
-                console.print(f"    delete: {lid[:12]}")
+                console.print(t("flow.repair_ts.dup_delete", sid=lid[:12]))
         if len(dry.duplicate_groups) > 10:
-            console.print(
-                f"  ... ({len(dry.duplicate_groups) - 10} more groups)"
-            )
+            console.print(t("flow.repair_ts.more_groups",
+                            n=len(dry.duplicate_groups) - 10))
 
     if dry.to_retime:
         console.print(
-            f"\n[bold]{len(dry.to_retime)} snapshot(s) will be retimed[/bold] "
-            f"(showing first 10):"
+            f"\n[bold]{t('flow.repair_ts.retime_header', count=len(dry.to_retime))}[/bold]"
         )
         for plan in dry.to_retime[:10]:
             old_iso = datetime.fromtimestamp(
@@ -650,21 +593,19 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
             )
             console.print(f"  {plan.snap_id[:12]}  {old_iso} → {new_iso}{label_part}")
         if len(dry.to_retime) > 10:
-            console.print(f"  ... ({len(dry.to_retime) - 10} more)")
+            console.print(t("flow.repair_ts.more_retimes",
+                            n=len(dry.to_retime) - 10))
 
     if not (dry.to_retime or dry.to_delete):
-        console.print("[green]vault is clean — nothing to do.[/green]")
+        console.print(f"[green]{t('flow.repair_ts.clean')}[/green]")
         return
 
     console.print()
     console.print(
-        "[yellow bold]This will modify the vault.[/yellow bold] "
-        "Duplicates will be deleted; survivors retimed. The chunk pool "
-        "is content-addressed so no chunk data is lost — only stale "
-        "manifest+index rows."
+        f"[yellow bold]{t('flow.repair_ts.warning_will_modify')}[/yellow bold]"
     )
-    if not confirm(console, "Apply the plan above?", default=False):
-        console.print("[dim]cancelled — vault unchanged.[/dim]")
+    if not confirm(console, t("flow.repair_ts.confirm_apply"), default=False):
+        console.print(f"[dim]{t('flow.repair_ts.cancelled')}[/dim]")
         return
 
     progress = make_progress(console)
@@ -675,7 +616,7 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
     console.print(f"[green]{result.summary()}[/green]")
     if result.errors:
         console.print(
-            f"[red]{len(result.errors)} error(s) during apply:[/red]"
+            f"[red]{t('flow.repair_ts.errors_header', count=len(result.errors))}[/red]"
         )
         for op, sid, msg in result.errors[:10]:
             console.print(f"  [{op}] {sid[:12]}: {msg}")
@@ -684,126 +625,103 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
 def run_restore_flow(console: Console, env: EnvironmentSummary):
     """Materialize a snapshot back to a directory on disk."""
     render_op_intro(
-        console, "Restore a snapshot",
-        "Pick a snapshot and reassemble its world tree to a destination "
-        "directory. Optionally restore only specific files (by manifest "
-        "relative path). The chunk pool is read-only — restore never "
-        "alters vault state.",
-        expects="The vault path, a snapshot to restore, and a destination dir.",
+        console, t("flow.restore.title"),
+        t("flow.restore.body"),
+        expects=t("flow.restore.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    snap = _pick_snapshot(console, repo, prompt="Snapshot to restore")
+    snap = _pick_snapshot(console, repo, prompt=t("prompt.snap_to_restore"))
     if snap is None:
         return
-    dest = prompt_path(console, "Destination directory", default=Path.cwd() / "restored")
+    dest = prompt_path(console, t("prompt.dest_dir"), default=Path.cwd() / "restored")
     if dest.exists() and any(dest.iterdir()):
-        if not confirm(
-            console, f"{dest} is not empty — write into it anyway?",
-            default=False,
-        ):
-            console.print("[dim]cancelled.[/dim]")
+        if not confirm(console, t("prompt.dest_not_empty", dest=dest), default=False):
+            console.print(f"[dim]{t('prompt.cancel')}[/dim]")
             return
     progress = make_progress(console)
     with progress:
         task = progress.add_task("restore", total=None)
         cb = _make_phase_cb(progress, task, prefix="phase")
         repo.restore(snap, dest, progress_cb=cb)
-    console.print(f"[green]restored[/green] {snap.short_id} → {dest}")
+    console.print(f"[green]{t('msg.restore.done', sid=snap.short_id, dest=dest)}[/green]")
 
 
 def run_delete_flow(console: Console, env: EnvironmentSummary):
     """Remove a snapshot from the vault. Chunks become eligible for gc."""
     render_op_intro(
-        console, "Delete a snapshot",
-        "Removes the snapshot's index row + manifest. Referenced chunks "
-        "have their ref counts decremented; chunks no longer referenced "
-        "by anything become eligible for garbage-collect (run gc to "
-        "actually reclaim their disk space).",
-        expects="The vault path and the snapshot to remove.",
+        console, t("flow.delete.title"),
+        t("flow.delete.body"),
+        expects=t("flow.delete.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    snap = _pick_snapshot(console, repo, prompt="Snapshot to delete")
+    snap = _pick_snapshot(console, repo, prompt=t("prompt.snap_to_delete"))
     if snap is None:
         return
     if not confirm(
         console,
-        f"DELETE snapshot {snap.short_id} ({snap.label or '-'})? This "
-        f"cannot be undone (but the chunk pool is content-addressed, so "
-        f"the same content can be re-ingested without data loss).",
+        t("prompt.delete_snap", sid=snap.short_id, label=snap.label or '-'),
         default=False,
     ):
-        console.print("[dim]cancelled.[/dim]")
+        console.print(f"[dim]{t('prompt.cancel')}[/dim]")
         return
     repo.delete(snap)
-    console.print(f"[green]deleted[/green] {snap.short_id}")
+    console.print(f"[green]{t('msg.delete.done', sid=snap.short_id)}[/green]")
 
 
 def run_retime_flow(console: Console, env: EnvironmentSummary):
     """Reassign one snapshot's timeline timestamp."""
     render_op_intro(
-        console, "Retime a snapshot",
-        "Reassign one snapshot's timeline timestamp. Either re-derive it "
-        "from the manifest's level.dat LastPlayed (recommended), or pass "
-        "an explicit ISO8601 datetime. The original timestamp is "
-        "preserved as an audit field. For vault-wide repair, use "
-        "[bold]Repair timestamps[/bold] instead.",
-        expects="The vault, a snapshot, and either nothing (auto) or a new ts.",
+        console, t("flow.retime.title"),
+        t("flow.retime.body"),
+        expects=t("flow.retime.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    snap = _pick_snapshot(console, repo, prompt="Snapshot to retime")
+    snap = _pick_snapshot(console, repo, prompt=t("prompt.snap_to_retime"))
     if snap is None:
         return
-    use_level_dat = confirm(
-        console, "Re-derive ts from manifest's level.dat LastPlayed?",
-        default=True,
-    )
+    use_level_dat = confirm(console, t("prompt.use_level_dat"), default=True)
     if use_level_dat:
         updated, source = repo.retime_snapshot_from_manifest(snap)
         if source == "no_last_played":
-            console.print(
-                f"[yellow]manifest has no LastPlayed — snapshot unchanged.[/yellow]"
-            )
+            console.print(f"[yellow]{t('msg.retime.no_lp')}[/yellow]")
             return
         console.print(
-            f"[green]retimed[/green] {updated.short_id} → "
-            f"{updated.timestamp.isoformat()} [from level.dat]"
+            f"[green]{t('msg.retime.done_from_lp', sid=updated.short_id, iso=updated.timestamp.isoformat())}[/green]"
         )
         return
     raw = prompt_path(
-        console, "New timestamp (ISO8601, e.g. 2024-06-15T10:30:00)",
+        console, t("prompt.new_ts"),
         default=Path(snap.timestamp.isoformat()),
     )
     try:
         new_ts = datetime.fromisoformat(str(raw))
     except ValueError as e:
-        console.print(f"[red]invalid timestamp: {e}[/red]")
+        console.print(f"[red]{t('msg.retime.invalid_ts', err=e)}[/red]")
         return
     if new_ts.tzinfo is None:
         new_ts = new_ts.replace(tzinfo=timezone.utc)
     updated = repo.retime_snapshot(snap, new_ts)
     console.print(
-        f"[green]retimed[/green] {updated.short_id} → {updated.timestamp.isoformat()}"
+        f"[green]{t('msg.retime.done_explicit', sid=updated.short_id, iso=updated.timestamp.isoformat())}[/green]"
     )
 
 
 def run_thumbnail_flow(console: Console, env: EnvironmentSummary):
     """Render thumbnail tiles for one snapshot or all snapshots."""
     render_op_intro(
-        console, "Render thumbnails",
-        "Render or backfill the small per-chunk PNG tiles used by the "
-        "browser and diff visualization. Idempotent — already-rendered "
-        "tiles are skipped via cache hit.",
-        expects="The vault and either one snapshot or 'all snapshots'.",
+        console, t("flow.thumbnail.title"),
+        t("flow.thumbnail.body"),
+        expects=t("flow.thumbnail.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    do_all = confirm(console, "Render thumbnails for ALL snapshots?", default=False)
+    do_all = confirm(console, t("prompt.thumbnails_all"), default=False)
     from ..viz.snapshot_render import (
         ensure_tiles_for_manifest, write_snapshot_sidecars,
     )
     from ..store.manifest import read_manifest
 
     targets = repo.list() if do_all else [
-        s for s in [_pick_snapshot(console, repo, prompt="Snapshot")] if s is not None
+        s for s in [_pick_snapshot(console, repo, prompt=t("flow.thumbnail.pick_one"))] if s is not None
     ]
     if not targets:
         return
@@ -815,55 +733,49 @@ def run_thumbnail_flow(console: Console, env: EnvironmentSummary):
             manifest = read_manifest(snap.manifest_path)
             ensure_tiles_for_manifest(repo, manifest, progress_cb=cb)
             write_snapshot_sidecars(repo, snap.id, manifest, progress_cb=cb)
-    console.print(f"[green]done[/green] — processed {len(targets)} snapshot(s)")
+    console.print(f"[green]{t('msg.thumbnail.done', count=len(targets))}[/green]")
 
 
 def run_browse_flow(console: Console, env: EnvironmentSummary):
     """Start the local Leaflet browser for the vault."""
     render_op_intro(
-        console, "Browse vault",
-        "Spin up a local HTTP server with a Leaflet-based map browser "
-        "for the vault. Open the printed URL in your browser. Press "
-        "Ctrl-C in this terminal to stop the server.",
-        expects="The vault path. Optional: bind host + port.",
+        console, t("flow.browse.title"),
+        t("flow.browse.body"),
+        expects=t("flow.browse.expects"),
     )
     repo = _pick_or_create_repo(console, env)
     host = "127.0.0.1"
     port = 8765
-    if confirm(console, f"Bind to {host}:{port}?", default=True):
+    if confirm(console, t("prompt.bind_default", host=host, port=port), default=True):
         pass
     else:
-        raw_host = prompt_path(console, "Host (use 0.0.0.0 to expose on LAN)",
-                               default=Path(host))
+        raw_host = prompt_path(console, t("prompt.bind_host"), default=Path(host))
         host = str(raw_host)
-        raw_port = prompt_path(console, "Port", default=Path(str(port)))
+        raw_port = prompt_path(console, t("prompt.bind_port"), default=Path(str(port)))
         try:
             port = int(str(raw_port))
         except ValueError:
-            console.print("[red]invalid port — falling back to 8765[/red]")
+            console.print(f"[red]{t('msg.invalid_port')}[/red]")
             port = 8765
     from ..viz.browser import serve
     try:
         serve(repo.repo_path, host=host, port=port)
     except KeyboardInterrupt:
-        console.print("\n[dim]server stopped.[/dim]")
+        console.print(f"\n[dim]{t('msg.browse.stopped')}[/dim]")
 
 
 def run_verify_roundtrip_flow(console: Console, env: EnvironmentSummary):
     """Compare a snapshot against a known-good source tree byte-for-byte."""
     render_op_intro(
-        console, "Verify round-trip",
-        "Restore a snapshot to a temp dir and compare against a known-"
-        "good source tree (the original world or extracted archive). "
-        "The snapshot passes only if every chunk + every file matches "
-        "byte-for-byte.",
-        expects="The vault, a snapshot, and the path to a source world dir.",
+        console, t("flow.verify_rt.title"),
+        t("flow.verify_rt.body"),
+        expects=t("flow.verify_rt.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    snap = _pick_snapshot(console, repo, prompt="Snapshot to verify")
+    snap = _pick_snapshot(console, repo, prompt=t("prompt.snap_to_verify"))
     if snap is None:
         return
-    source = prompt_path(console, "Original world directory", default=Path.cwd())
+    source = prompt_path(console, t("prompt.original_world"), default=Path.cwd())
     from ..store.roundtrip import verify_roundtrip
     progress = make_progress(console)
     with progress:
@@ -877,21 +789,17 @@ def run_verify_roundtrip_flow(console: Console, env: EnvironmentSummary):
 def run_verify_folders_flow(console: Console, env: EnvironmentSummary):
     """Compare two arbitrary directory trees byte-for-byte."""
     render_op_intro(
-        console, "Verify two folders",
-        "Compare two directory trees (e.g. a restored snapshot vs a "
-        "manually extracted archive) chunk-by-chunk for region files "
-        "and byte-by-byte for everything else. No vault required.",
-        expects="Two directory paths. Optional: a path for a written report.",
+        console, t("flow.verify_dirs.title"),
+        t("flow.verify_dirs.body"),
+        expects=t("flow.verify_dirs.expects"),
     )
-    a = prompt_path(console, "Left directory (treat as source)", default=Path.cwd())
-    b = prompt_path(console, "Right directory (treat as restore)", default=Path.cwd())
-    write_report = confirm(
-        console, "Write a detailed text report to file?", default=False,
-    )
+    a = prompt_path(console, t("prompt.left_dir"), default=Path.cwd())
+    b = prompt_path(console, t("prompt.right_dir"), default=Path.cwd())
+    write_report = confirm(console, t("prompt.write_report"), default=False)
     report_path = None
     if write_report:
         report_path = prompt_path(
-            console, "Report path",
+            console, t("prompt.report_path"),
             default=Path.cwd() / "verify-folders-report.txt",
         )
     from ..store.roundtrip import compare_directories
@@ -905,34 +813,31 @@ def run_verify_folders_flow(console: Console, env: EnvironmentSummary):
     if report_path is not None:
         from ..cli import _write_verify_folders_report
         _write_verify_folders_report(report_path, a, b, report)
-        console.print(f"[dim]detailed report: {report_path}[/dim]")
+        console.print(f"[dim]{t('flow.verify_dirs.report_written', path=report_path)}[/dim]")
 
 
 def run_logs_flow(console: Console, env: EnvironmentSummary):
     """Sub-menu for the parallel log-snapshot subsystem."""
     render_op_intro(
-        console, "Logs subsystem",
-        "Logs and crash-reports captured during ingest live in a "
-        "parallel deduplicated pool, separate from world snapshots. "
-        "Browse / extract / delete them here without touching world data.",
-        expects="The vault, then an action: list / extract / delete.",
+        console, t("flow.logs.title"),
+        t("flow.logs.body"),
+        expects=t("flow.logs.expects"),
     )
     repo = _pick_or_create_repo(console, env)
-    action = choose_one(
-        console, "What to do with logs?",
-        [
-            "list   │ show every log snapshot",
-            "extract │ materialize a log snapshot to a directory",
-            "delete │ remove a log snapshot",
-            "back",
-        ],
-    )
-    if action.startswith("back"):
+    actions = [
+        t("prompt.logs.action.list"),
+        t("prompt.logs.action.extract"),
+        t("prompt.logs.action.delete"),
+        t("prompt.logs.action.back"),
+    ]
+    action = choose_one(console, t("prompt.logs.action"), actions)
+    # Match by index, not prefix — translated strings won't share an English prefix.
+    if action == actions[3]:   # back
         return
-    if action.startswith("list"):
+    if action == actions[0]:   # list
         snaps = repo.list_log_snapshots()
         if not snaps:
-            console.print("[yellow](no log snapshots)[/yellow]")
+            console.print(f"[yellow]{t('msg.no_log_snapshots')}[/yellow]")
             return
         for s in snaps:
             console.print(
@@ -941,34 +846,35 @@ def run_logs_flow(console: Console, env: EnvironmentSummary):
                 f"servers={s.server_count} files={s.file_count}"
             )
         return
-    if action.startswith("extract"):
-        snap = _pick_log_snapshot(console, repo, prompt="Log snapshot to extract")
+    if action == actions[1]:   # extract
+        snap = _pick_log_snapshot(console, repo, prompt=t("prompt.log_snap_to_extract"))
         if snap is None:
             return
         dest = prompt_path(
-            console, "Destination directory",
+            console, t("prompt.dest_dir"),
             default=Path.cwd() / "logs-extracted",
         )
         from ..store.log_manifest import read_log_manifest
         servers = list(read_log_manifest(snap.manifest_path).servers)
         wanted: str | None = None
         if servers and len(servers) > 1:
-            if confirm(console, "Filter to one server only?", default=False):
-                wanted = choose_one(console, "Server", servers)
+            if confirm(console, t("prompt.filter_to_one_server"), default=False):
+                wanted = choose_one(console, t("prompt.server"), servers)
         repo.extract_logs(snap, dest, server=wanted)
-        console.print(f"[green]extracted[/green] → {dest}")
+        console.print(f"[green]{t('msg.logs.extract_done', dest=dest)}[/green]")
         return
-    if action.startswith("delete"):
-        snap = _pick_log_snapshot(console, repo, prompt="Log snapshot to delete")
+    if action == actions[2]:   # delete
+        snap = _pick_log_snapshot(console, repo, prompt=t("prompt.log_snap_to_delete"))
         if snap is None:
             return
         if not confirm(
-            console, f"DELETE log snapshot {snap.short_id}?", default=False,
+            console, t("prompt.delete_log_snap", sid=snap.short_id),
+            default=False,
         ):
-            console.print("[dim]cancelled.[/dim]")
+            console.print(f"[dim]{t('prompt.cancel')}[/dim]")
             return
         repo.delete_log_snapshot(snap)
-        console.print(f"[green]deleted log snapshot[/green] {snap.short_id}")
+        console.print(f"[green]{t('msg.logs.delete_done', sid=snap.short_id)}[/green]")
 
 
 def run_language_flow(console: Console, env: EnvironmentSummary):
@@ -998,8 +904,7 @@ def run_language_flow(console: Console, env: EnvironmentSummary):
     saved_path = i18n.set_locale(chosen.tag)
     if saved_path is None:
         console.print(
-            f"[yellow]language switched to {chosen.native_name} for this "
-            f"session, but could not write the config file.[/yellow]"
+            f"[yellow]{i18n.t('msg.lang.fallback_no_save', name=chosen.native_name)}[/yellow]"
         )
     else:
         console.print(i18n.t(
