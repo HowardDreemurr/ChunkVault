@@ -281,6 +281,67 @@ D:\backup-vault\
 
 ---
 
+## Snapshot lifecycle & crash safety
+
+The chunk-store backend writes "make new state visible **last**." A
+snapshot is invisible to `repo.list()` / `repo.get()` until both its
+manifest is on disk **and** its chunk references have been committed in
+the index. A crash before that point leaves orphan blobs but never a
+half-visible snapshot.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RegionsPhase: repo.snapshot()
+    RegionsPhase --> FilesPhase: all .mca processed
+    FilesPhase --> ManifestWritten: atomic temp + rename
+    ManifestWritten --> Committed: refs += 1, INSERT snapshots row
+    Committed --> Tiles: render thumbnails
+    Tiles --> Verifying: verify_roundtrip=True
+    Tiles --> [*]: verify_roundtrip=False
+    Verifying --> [*]: report.passed
+    Verifying --> Failed: report.passed == False
+
+    RegionsPhase: chunks → pool, ref=0
+    FilesPhase: non-region files → pool, ref=0
+    ManifestWritten: .mcbk on disk; still invisible
+    Committed: snapshot visible to list/get/restore
+    Tiles: thumbnails (failures non-fatal, warning only)
+    Verifying: full restore + byte compare
+    Failed: snapshot kept; RoundTripVerificationError raised
+```
+
+| Crash during | On-disk leftovers | Visible? | Cleanup |
+|---|---|---|---|
+| `RegionsPhase` / `FilesPhase` | new blobs in `chunks/` and `files/` with `ref_count=0`; possibly `*.tmp.<pid>` from interrupted atomic writes | no | `chunkvault gc` reclaims orphans |
+| Between manifest write and ref commit | `.mcbk` exists in `manifests/` but no `snapshots` row | no | `chunkvault gc` (and `verify --repair`) |
+| `Tiles` | snapshot fully committed; some thumbnails missing | **yes** | `chunkvault thumbnail --all` backfills |
+| `Verifying` | snapshot committed; partial restore in `%TEMP%` | **yes** | report flagged; user inspects, may `delete` |
+
+**Invariant**: a snapshot in `repo.list()` always has a complete manifest, every referenced chunk on disk, and ref counts incremented. The fast paths below are pure performance — they never relax this invariant.
+
+### Region-content cache
+
+A per-region soft cache: `sha256(region_bytes) → packed chunk records`. Hits skip parse + per-chunk hashing entirely; misses fall back to the slow path which repopulates.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Cold
+    Cold --> Warm: slow path completes (no externals)
+    Warm --> Stale: gc reclaims a referenced chunk
+    Stale --> Warm: next snapshot re-runs slow path, refreshes row
+    Warm --> Warm: hit — returns cached records, near-zero cost
+
+    Cold: no row in region_cache
+    Warm: row + every cached chunk hash still present in pool
+    Stale: row exists but some refs missing — caller falls through
+```
+
+`backfill_region_cache(world, snap)` shortcuts `Cold → Warm` for snapshots taken before the cache existed: it hashes each .mca's bytes once and pairs the sha with the manifest's pre-computed records — no chunk hashing, no parsing. `ingest_archive` calls it automatically when re-ingesting an already-known archive.
+
+Regions containing external (`.mcc`) chunks always stay `Cold`. Their fingerprint depends on .mcc bytes too, so keying by region_sha alone would return stale hashes — they benefit from the bulk SQLite probe but never from cache hits.
+
+---
+
 ## Why chunk-store works at scale
 
 The thing git, restic, and friends miss: a Minecraft chunk's content is determined by its **decompressed NBT tree**, but every save also rewrites a `LastUpdate` integer. Run two backups a minute apart, the chunk's *bytes* differ, the *content* does not.
