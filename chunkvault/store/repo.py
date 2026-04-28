@@ -1433,7 +1433,11 @@ class ChunkSnapshotRepo:
 
     # ---- gc ----------------------------------------------------------------
 
-    def fsck(self, *, repair: bool = True) -> "FsckReport":
+    def fsck(
+        self, *,
+        repair: bool = True,
+        progress_cb: ProgressCallback = None,
+    ) -> "FsckReport":
         """Reconcile the repo's on-disk state with the index.
 
         Detects and (optionally) fixes the kinds of inconsistencies that
@@ -1549,14 +1553,26 @@ class ChunkSnapshotRepo:
             # what's missing here. This catches the migrate-mca chaos
             # window where chunks landed in the pool + manifest but never
             # got registered in the index.
+            indexed_with_disk = [
+                (sid, row) for sid, row in indexed_manifests.items()
+                if sid in on_disk_manifests
+            ]
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="fsck_reconcile",
+                label=f"reading {len(indexed_with_disk)} manifests for ref-count check",
+                total=len(indexed_with_disk),
+            ))
             expected_chunk_refs: dict[bytes, int] = {}
             expected_file_refs: dict[bytes, int] = {}
-            for snap_id, row in indexed_manifests.items():
-                if snap_id not in on_disk_manifests:
-                    continue   # already handled above as dangling row
+            for i, (snap_id, row) in enumerate(indexed_with_disk, 1):
                 try:
                     m = read_manifest(on_disk_manifests[snap_id])
                 except Exception:
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="fsck_reconcile",
+                        label=f"unreadable {snap_id[:12]}",
+                        current=i, total=len(indexed_with_disk),
+                    ))
                     continue
                 for regions in m.dimensions.values():
                     for region in regions:
@@ -1568,6 +1584,15 @@ class ChunkSnapshotRepo:
                     expected_file_refs[f.sha256] = (
                         expected_file_refs.get(f.sha256, 0) + 1
                     )
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="fsck_reconcile",
+                    label=f"{snap_id[:12]} ({len(expected_chunk_refs)} unique chunks so far)",
+                    current=i, total=len(indexed_with_disk),
+                ))
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="fsck_reconcile",
+                current=len(indexed_with_disk), total=len(indexed_with_disk),
+            ))
 
             # Check each expected ref against the index. We only DETECT
             # under-references here (manifest needs more than index has);
@@ -1872,20 +1897,13 @@ class ChunkSnapshotRepo:
         # fsck's repairs are themselves safe and idempotent, and a clean
         # vault is a precondition for the dry-run report being accurate.
         if fsck_first:
-            _emit(progress_cb, ProgressEvent(
-                kind="phase_start", phase="repair_pre_fsck",
-                label=_t("phase.repair_scan.reading", count=0),  # placeholder, fsck has its own progress
-            ))
             try:
-                self.fsck(repair=True)
+                self.fsck(repair=True, progress_cb=progress_cb)
             except Exception as e:
                 _emit(progress_cb, ProgressEvent(
                     kind="warning", phase="repair_pre_fsck",
                     label=f"fsck failed (continuing): {e}",
                 ))
-            _emit(progress_cb, ProgressEvent(
-                kind="phase_done", phase="repair_pre_fsck",
-            ))
 
         report = RepairReport()
         all_snaps = self.list()
@@ -2136,7 +2154,7 @@ class ChunkSnapshotRepo:
         # plan is built against a consistent vault.
         if fsck_first:
             try:
-                self.fsck(repair=True)
+                self.fsck(repair=True, progress_cb=progress_cb)
             except Exception as e:
                 _emit(progress_cb, ProgressEvent(
                     kind="warning", phase="migrate_mca_pre_fsck",

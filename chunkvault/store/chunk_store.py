@@ -81,18 +81,30 @@ class ChunkStore:
 
     @staticmethod
     def _atomic_store(path: Path, content: bytes) -> bool:
-        """Write atomically. Returns True if newly created."""
+        """Write atomically. Returns True if newly created.
+
+        The tmp filename includes pid + thread id + a 4-byte random suffix.
+        ``pid`` alone wasn't enough: two threads in the same process writing
+        the same content-hash (deduped chunk content) would collide on
+        ``<hash>.tmp.<pid>``, mid-flight overwrites would corrupt the bytes
+        that the rename publishes. Adding ``threading.get_ident()`` plus
+        random bytes makes per-call tmp names unique across both threads
+        and processes, while still being deterministic enough to clean up.
+        """
         if path.is_file():
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Use a unique tmp name so concurrent writers don't collide.
-        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        import threading, os as _os
+        suffix = f"{_os.getpid()}.{threading.get_ident()}.{_os.urandom(4).hex()}"
+        tmp = path.with_name(f"{path.name}.tmp.{suffix}")
         tmp.write_bytes(content)
         try:
             os.replace(tmp, path)
         except OSError:
-            # Replace can fail on Windows if dest opened by another reader —
-            # extremely unlikely for fresh content. Clean up and report no-op.
+            # Replace can fail on Windows if dest opened by another reader,
+            # or if a concurrent writer already published the same content.
+            # Either way, clean up our tmp and report whether the dest now
+            # exists (likely True if a sibling thread/process won the race).
             try:
                 tmp.unlink()
             except OSError:

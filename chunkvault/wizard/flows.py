@@ -509,7 +509,11 @@ def run_fsck_flow(console: Console, env: EnvironmentSummary):
     )
     repo = _pick_or_create_repo(console, env)
     dry_run = confirm(console, t("prompt.fsck_dryrun"), default=False)
-    report = repo.fsck(repair=not dry_run)
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("fsck", total=None)
+        cb = _make_phase_cb(progress, task, prefix="fsck")
+        report = repo.fsck(repair=not dry_run, progress_cb=cb)
     if report.clean:
         console.print(f"[green]{t('msg.fsck.clean')}[/green]")
         return
