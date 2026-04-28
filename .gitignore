@@ -55,5 +55,8 @@ backup-repo/
 *.log
 logs/
 
+# MkDocs build output
+site/
+
 # Claude Code internal state
 .claude/
