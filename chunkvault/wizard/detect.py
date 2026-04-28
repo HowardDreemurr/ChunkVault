@@ -215,13 +215,29 @@ def detect_environment(
 ) -> EnvironmentSummary:
     """Survey the local machine for repos and archive directories.
 
-    Both lists are optional — when omitted, the function searches a small
-    set of conventional defaults (cwd + drive roots / home + /mnt).
+    Order of precedence (deduped by resolved path):
+    1. Explicit ``repo_candidates`` / ``source_candidates`` (tests, CLI).
+    2. User-registered paths from ``~/.chunkvault/config.json``
+       (``chunkvault repo add``, ``chunkvault source add``).
+    3. Conventional defaults: cwd + a few near-cwd names.
+
+    Without (2) the wizard could never find a vault on a user's `F:\\`
+    drive when launched from `C:\\Users\\HAOYA`. The registry persists
+    locations across runs.
     """
-    repo_paths = repo_candidates if repo_candidates is not None \
-        else _default_repo_candidates()
-    source_paths = source_candidates if source_candidates is not None \
-        else default_paths_to_scan()
+    from . import config as _cfg
+
+    if repo_candidates is None:
+        repo_paths = [r.path for r in _cfg.list_repos()]
+        repo_paths.extend(_default_repo_candidates())
+    else:
+        repo_paths = list(repo_candidates)
+
+    if source_candidates is None:
+        source_paths = [s.path for s in _cfg.list_source_paths()]
+        source_paths.extend(default_paths_to_scan())
+    else:
+        source_paths = list(source_candidates)
 
     repos: list[RepoSummary] = []
     seen_repo: set[Path] = set()

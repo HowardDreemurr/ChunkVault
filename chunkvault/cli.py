@@ -247,6 +247,70 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repo_list(args: argparse.Namespace) -> int:
+    from .wizard import config as _cfg
+    repos = _cfg.list_repos()
+    if not repos:
+        print("(no registered repos — use `chunkvault repo add <path>`)")
+        return 0
+    for r in repos:
+        label = f"  [{r.label}]" if r.label else ""
+        marker = "" if r.path.is_dir() else "  [missing]"
+        print(f"{r.path}{label}{marker}")
+    return 0
+
+
+def cmd_repo_add(args: argparse.Namespace) -> int:
+    from .wizard import config as _cfg
+    added = _cfg.add_repo(args.path, label=args.label or "")
+    msg = "added" if added else "already registered (label updated if changed)"
+    print(f"{msg}: {Path(args.path).expanduser().resolve()}")
+    print(f"# config: {_cfg.config_path()}")
+    return 0
+
+
+def cmd_repo_remove(args: argparse.Namespace) -> int:
+    from .wizard import config as _cfg
+    removed = _cfg.remove_repo(args.path)
+    if removed:
+        print(f"removed: {Path(args.path).expanduser().resolve()}")
+        return 0
+    print(f"!! not registered: {args.path}", file=sys.stderr)
+    return 1
+
+
+def cmd_source_list(args: argparse.Namespace) -> int:
+    from .wizard import config as _cfg
+    sources = _cfg.list_source_paths()
+    if not sources:
+        print("(no registered source paths — "
+              "use `chunkvault source add <path>`)")
+        return 0
+    for s in sources:
+        label = f"  [{s.label}]" if s.label else ""
+        marker = "" if s.path.is_dir() else "  [missing]"
+        print(f"{s.path}{label}{marker}")
+    return 0
+
+
+def cmd_source_add(args: argparse.Namespace) -> int:
+    from .wizard import config as _cfg
+    added = _cfg.add_source_path(args.path, label=args.label or "")
+    msg = "added" if added else "already registered (label updated if changed)"
+    print(f"{msg}: {Path(args.path).expanduser().resolve()}")
+    return 0
+
+
+def cmd_source_remove(args: argparse.Namespace) -> int:
+    from .wizard import config as _cfg
+    removed = _cfg.remove_source_path(args.path)
+    if removed:
+        print(f"removed: {Path(args.path).expanduser().resolve()}")
+        return 0
+    print(f"!! not registered: {args.path}", file=sys.stderr)
+    return 1
+
+
 def cmd_logs_list(args: argparse.Namespace) -> int:
     from .store import ChunkSnapshotRepo
     repo = ChunkSnapshotRepo(args.repo)
@@ -979,6 +1043,46 @@ def build_parser() -> argparse.ArgumentParser:
              "--no-fsck for context.",
     )
     mm.set_defaults(func=cmd_migrate_mca_files)
+
+    # ---- registry: repo + source paths ------------------------------------
+    repo_p = sub.add_parser(
+        "repo",
+        help="Manage registered vault paths (so the wizard finds them on "
+             "launch even from a different cwd).",
+    )
+    repo_sub = repo_p.add_subparsers(dest="repo_action", required=True)
+
+    rl = repo_sub.add_parser("list", help="List registered vaults.")
+    rl.set_defaults(func=cmd_repo_list)
+
+    ra = repo_sub.add_parser("add", help="Register a vault path.")
+    ra.add_argument("path", type=Path, help="Path to a chunkvault vault.")
+    ra.add_argument("--label", type=str, default=None,
+                    help="Optional friendly name for this vault.")
+    ra.set_defaults(func=cmd_repo_add)
+
+    rr = repo_sub.add_parser("remove", help="Unregister a vault path.")
+    rr.add_argument("path", type=Path)
+    rr.set_defaults(func=cmd_repo_remove)
+
+    src_p = sub.add_parser(
+        "source",
+        help="Manage registered source-archive directories (the ingest "
+             "wizard scans these on launch).",
+    )
+    src_sub = src_p.add_subparsers(dest="source_action", required=True)
+
+    sl = src_sub.add_parser("list", help="List registered source paths.")
+    sl.set_defaults(func=cmd_source_list)
+
+    sa = src_sub.add_parser("add", help="Register a source-archive directory.")
+    sa.add_argument("path", type=Path)
+    sa.add_argument("--label", type=str, default=None)
+    sa.set_defaults(func=cmd_source_add)
+
+    sr = src_sub.add_parser("remove", help="Unregister a source-archive directory.")
+    sr.add_argument("path", type=Path)
+    sr.set_defaults(func=cmd_source_remove)
 
     ll = sub.add_parser("logs-list", help="List log snapshots.")
     ll.add_argument("repo", type=Path)
