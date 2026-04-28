@@ -209,6 +209,23 @@ render_diff_html(diff, out_path="diff.html",
 repo.restore(snap, "D:/tmp", paths=["region/r.0.0.mca"])
 ```
 
+### Read snapshot contents directly (no restore-to-disk needed)
+
+```python
+import gzip
+
+# Iterate every player's NBT across a snapshot
+for path, data in repo.iter_snapshot_files(snap, prefix="playerdata/"):
+    nbt = gzip.decompress(data)
+    # parse NBT with nbtlib or chunkvault.mca.nbt_lite
+
+# Or grab a specific file
+level_dat = repo.read_snapshot_file(snap, "level.dat")
+```
+
+See [`docs/analytics.md`](docs/analytics.md) for cross-snapshot
+analytics, chunk-level access, and worked examples.
+
 ### Multi-server archive in two lines
 
 ```python

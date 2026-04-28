@@ -1163,6 +1163,118 @@ class ChunkSnapshotRepo:
 
         return rec, len(new_hashes)
 
+    # ---- snapshot file access (analytics-friendly) ------------------------
+    #
+    # These three methods give read-only access to a snapshot's non-region
+    # files (level.dat, playerdata/*.dat, data/*.dat, datapacks/*.zip,
+    # advancements/*.json, etc.) without restoring anything to disk. The
+    # chunk pool is content-addressed so cross-snapshot reads of the same
+    # underlying file are O(1) — you can iterate "every player's position
+    # across 100 snapshots" without touching the pool more than once per
+    # unique sha256.
+
+    def list_snapshot_files(
+        self, snapshot: "ChunkSnapshot | str", *,
+        prefix: str | None = None,
+        suffix: str | None = None,
+    ) -> list[tuple[str, bytes]]:
+        """Return ``[(relative_path, sha256), ...]`` for every non-region
+        file in the snapshot's manifest.
+
+        Cheap — reads the manifest once and returns a Python list, no
+        blob I/O. Use this for catalog-only queries: "how many
+        playerdata files?", "which datapacks are bundled?", etc.
+
+        ``prefix`` / ``suffix`` are simple ``str.startswith`` /
+        ``str.endswith`` filters on the manifest's posix-style relative
+        paths. Both can be combined.
+
+        Examples:
+            # All players in the snapshot
+            entries = repo.list_snapshot_files(snap, prefix="playerdata/")
+            # → [("playerdata/abc-uuid.dat", b"\\x12..."), ...]
+
+            # All bundled datapack archives
+            zips = repo.list_snapshot_files(snap, prefix="datapacks/", suffix=".zip")
+        """
+        snap = (snapshot if isinstance(snapshot, ChunkSnapshot)
+                else self.get(snapshot))
+        if snap is None:
+            raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
+        manifest = read_manifest(snap.manifest_path)
+        out: list[tuple[str, bytes]] = []
+        for fr in manifest.files:
+            if prefix and not fr.relative_path.startswith(prefix):
+                continue
+            if suffix and not fr.relative_path.endswith(suffix):
+                continue
+            out.append((fr.relative_path, fr.sha256))
+        return out
+
+    def iter_snapshot_files(
+        self, snapshot: "ChunkSnapshot | str", *,
+        prefix: str | None = None,
+        suffix: str | None = None,
+    ) -> Iterator[tuple[str, bytes]]:
+        """Yield ``(relative_path, content_bytes)`` for each matching
+        non-region file in the snapshot.
+
+        Streams via the chunk pool — bytes are loaded one file at a
+        time, not all up-front. Safe to iterate over thousands of
+        files without exhausting memory.
+
+        ``content_bytes`` is the file's raw on-disk bytes as MC wrote
+        them. NBT files (level.dat, playerdata, etc.) are gzip-compressed;
+        callers should ``gzip.decompress(data)`` before parsing the NBT
+        with :mod:`chunkvault.mca.nbt_lite` or another NBT library.
+
+        Examples:
+            # Iterate every player's NBT
+            import gzip
+            from chunkvault.mca.nbt_lite import find_data_version
+            for path, data in repo.iter_snapshot_files(snap, prefix="playerdata/"):
+                nbt = gzip.decompress(data)
+                # ... parse NBT, extract Pos / health / dimension / ...
+        """
+        snap = (snapshot if isinstance(snapshot, ChunkSnapshot)
+                else self.get(snapshot))
+        if snap is None:
+            raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
+        manifest = read_manifest(snap.manifest_path)
+        for fr in manifest.files:
+            if prefix and not fr.relative_path.startswith(prefix):
+                continue
+            if suffix and not fr.relative_path.endswith(suffix):
+                continue
+            blob = self.chunks.read_file(fr.sha256)
+            if blob is not None:
+                yield fr.relative_path, blob
+
+    def read_snapshot_file(
+        self, snapshot: "ChunkSnapshot | str",
+        relative_path: str,
+    ) -> bytes | None:
+        """Read one file from a snapshot by its manifest-relative path.
+
+        Returns the raw on-disk bytes (still gzip-compressed for NBT
+        files), or ``None`` if no file with that path is in the snapshot.
+
+        Examples:
+            data = repo.read_snapshot_file(snap, "level.dat")
+            if data is not None:
+                nbt = gzip.decompress(data)
+                ...
+        """
+        snap = (snapshot if isinstance(snapshot, ChunkSnapshot)
+                else self.get(snapshot))
+        if snap is None:
+            raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
+        manifest = read_manifest(snap.manifest_path)
+        for fr in manifest.files:
+            if fr.relative_path == relative_path:
+                return self.chunks.read_file(fr.sha256)
+        return None
+
     # ---- enumeration --------------------------------------------------------
 
     def list(self) -> list[ChunkSnapshot]:
