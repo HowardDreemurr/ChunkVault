@@ -233,6 +233,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         skip_logs=args.skip_logs,
         verify_roundtrip=not args.no_verify,
         timestamp=forced_ts,
+        server_filter=getattr(args, "server_filter", None),
     )
     print(f"ingested {args.archive.name}")
     print(f"  servers: {', '.join(result.server_names) or '(none)'}")
@@ -932,6 +933,14 @@ def build_parser() -> argparse.ArgumentParser:
              "level.dat LastPlayed; use this only when level.dat lacks "
              "the field and you can supply a known-good ts another way "
              "(e.g. '2024-06-15T10:30:00').",
+    )
+    ing.add_argument(
+        "--server-filter", type=str, default=None, metavar="NAME",
+        help="Only ingest the named server folder from the archive. "
+             "Other servers (e.g. CR-Server when filtering for "
+             "EX-Server) are skipped silently. Used for the per-server-"
+             "vault workflow where the same archive is ingested into "
+             "multiple vaults, one per server.",
     )
     ing.set_defaults(func=cmd_ingest)
 

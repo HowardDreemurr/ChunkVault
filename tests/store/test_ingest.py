@@ -341,6 +341,98 @@ def test_ingest_is_idempotent_on_re_run(tmp_path: Path):
     assert len(repo.list_log_snapshots()) == log_snap_count_after_first
 
 
+def test_ingest_archive_server_filter(tmp_path: Path):
+    """server_filter=NAME drops every other server in the archive."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server", payload=b"ex")
+    _make_server(src, "CR-Server", payload=b"cr")
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    result = ingest_archive(repo, archive, server_filter="EX-Server")
+    assert len(result.snapshots) == 1
+    assert result.snapshots[0].world_name == "EX-Server"
+    # CR-Server didn't get snapshotted
+    assert all(s.world_name != "CR-Server" for s in result.snapshots)
+
+
+def test_ingest_archive_server_filter_no_match_returns_empty(tmp_path: Path):
+    """A filter that matches nothing returns an empty IngestResult, not raises."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server")
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    result = ingest_archive(repo, archive, server_filter="NoSuchServer")
+    assert result.snapshots == []
+
+
+def test_ingest_archive_per_server_vaults(tmp_path: Path):
+    """The new helper extracts the archive once and routes each server
+    to its own vault. The whole point of vault-per-server."""
+    from chunkvault.store.ingest import ingest_archive_per_server_vaults
+
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server", payload=b"ex")
+    _make_server(src, "CR-Server", payload=b"cr")
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    ex_vault = ChunkSnapshotRepo(tmp_path / "ex"); ex_vault.init()
+    cr_vault = ChunkSnapshotRepo(tmp_path / "cr"); cr_vault.init()
+
+    def resolver(server_name: str):
+        if server_name == "EX-Server":
+            return ex_vault
+        if server_name == "CR-Server":
+            return cr_vault
+        return None
+
+    results = ingest_archive_per_server_vaults(
+        archive, resolver, verify_roundtrip=False,
+    )
+    assert "EX-Server" in results
+    assert "CR-Server" in results
+    # Each vault has exactly one snapshot, with the right world_name
+    ex_snaps = ex_vault.list()
+    cr_snaps = cr_vault.list()
+    assert len(ex_snaps) == 1 and ex_snaps[0].world_name == "EX-Server"
+    assert len(cr_snaps) == 1 and cr_snaps[0].world_name == "CR-Server"
+    # The vaults are TRULY separate — EX vault has only its chunks
+    ex_chunks = sum(1 for p in (ex_vault.repo_path / "chunks").rglob("*")
+                    if p.is_file())
+    cr_chunks = sum(1 for p in (cr_vault.repo_path / "chunks").rglob("*")
+                    if p.is_file())
+    assert ex_chunks > 0 and cr_chunks > 0
+    # And one vault doesn't contain the other's chunks (different payloads)
+
+
+def test_per_server_vaults_skips_unresolved_servers(tmp_path: Path):
+    """Resolver returns None for a server → that server is skipped."""
+    from chunkvault.store.ingest import ingest_archive_per_server_vaults
+
+    src = tmp_path / "src"
+    _make_server(src, "EX-Server")
+    _make_server(src, "CR-Server")
+    archive = tmp_path / "2025-04-25-12-34-56.zip"
+    _zip_dir(archive, src)
+
+    ex_vault = ChunkSnapshotRepo(tmp_path / "ex"); ex_vault.init()
+
+    def resolver(server_name: str):
+        return ex_vault if server_name == "EX-Server" else None
+
+    results = ingest_archive_per_server_vaults(
+        archive, resolver, verify_roundtrip=False,
+    )
+    assert "EX-Server" in results
+    assert "CR-Server" not in results   # skipped because resolver returned None
+
+
 def test_ingest_refuses_server_without_last_played(tmp_path: Path):
     """A server whose level.dat lacks LastPlayed must NOT silently fall
     back to now() — that's the bug that produced 233 wrong-timestamped

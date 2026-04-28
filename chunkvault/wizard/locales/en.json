@@ -271,5 +271,16 @@
   "phase.compare_regions.label": "comparing chunks",
   "phase.compare_files.label": "comparing non-region files",
   "phase.restore_regions.label": "{count} region files → {dest}",
-  "phase.logs.label": "capturing logs"
+  "phase.logs.label": "capturing logs",
+
+  "prompt.per_server_vaults": "Each server gets its own vault? (recommended for multi-server archives)",
+  "per_server.no_servers": "no servers detected in selected archives — nothing to ingest.",
+  "per_server.found_servers": "Found {n} unique server(s) across {archives} archive(s):",
+  "per_server.no_match_prompt": "no matching registered vault. Suggested: {path}",
+  "per_server.create_vault": "Create a new vault for {server}?",
+  "per_server.skip_server": "{server} will be skipped — no vault to ingest into",
+  "per_server.vault_path_prompt": "Vault path for {server}",
+  "per_server.created": "created → {path} (registered)",
+  "per_server.no_vaults": "no vaults to ingest into — cancelled.",
+  "per_server.done_summary": "done. {snaps} snapshots across {vaults} vault(s), from {archives} archive(s)."
 }

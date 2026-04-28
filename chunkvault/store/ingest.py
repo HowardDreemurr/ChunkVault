@@ -265,6 +265,7 @@ def ingest_archive(
     progress_cb: ProgressCallback = None,
     skip_logs: bool = False,
     verify_roundtrip: bool = True,
+    server_filter: str | None = None,
 ) -> IngestResult:
     """Ingest one multi-server archive into ``repo``.
 
@@ -305,6 +306,24 @@ def ingest_archive(
                 f"{archive_path.name}: no server folders detected "
                 f"(looked for any directory containing region/r.X.Z.mca files)"
             )
+        # Optional server filter — for per-server-vault workflows where
+        # the same archive is ingested into multiple vaults, one per
+        # server. Drops every other server before processing.
+        if server_filter is not None:
+            servers = [s for s in servers if s.server_name == server_filter]
+            if not servers:
+                # Not an error: caller knows this archive doesn't have
+                # this server. Return an empty result.
+                _emit(progress_cb, ProgressEvent(
+                    kind="finish", phase="ingest_archive",
+                    label=archive_path.name,
+                    detail={"server_filter_no_match": server_filter},
+                ))
+                return IngestResult(
+                    archive=archive_path,
+                    timestamp=timestamp or datetime.now(timezone.utc),
+                    label="",
+                )
 
         # Read each server's authoritative ts from level.dat upfront so the
         # archive-level fields (used by log snapshot + IngestResult.label)
@@ -463,3 +482,166 @@ def ingest_archive(
         },
     ))
     return result
+
+
+def preview_archive_servers(archive: Path | str) -> list[str]:
+    """Cheaply enumerate the server names in an archive.
+
+    Used by the per-server-vault wizard flow to figure out which vaults
+    to route each archive's content into. Reads + extracts the archive
+    just to discover folder structure — doesn't hash chunks.
+
+    Returns server_name strings in the order discover_servers_full
+    finds them. Empty list if no servers detected (or archive is
+    unreadable). Doesn't raise on extract errors.
+    """
+    archive_path = Path(archive)
+    try:
+        with _extract_or_passthrough(archive_path) as extracted:
+            return [s.server_name for s in discover_servers_full(extracted)]
+    except Exception:
+        return []
+
+
+def ingest_archive_per_server_vaults(
+    archive: Path | str,
+    vault_resolver: "Callable[[str], ChunkSnapshotRepo | None]",
+    *,
+    timestamp: datetime | None = None,
+    progress_cb: ProgressCallback = None,
+    skip_logs: bool = False,
+    verify_roundtrip: bool = True,
+) -> dict[str, IngestResult]:
+    """Ingest each server in ``archive`` into a different vault.
+
+    The archive is extracted ONCE; then for each server discovered
+    inside it, ``vault_resolver(server_name)`` is called to get the
+    target vault. Servers whose resolver returns ``None`` are skipped.
+
+    Returns ``{server_name: IngestResult}`` — one entry per server
+    that was actually routed somewhere. Servers that the resolver
+    returned None for don't appear in the result map.
+
+    The single extraction is the whole point: extracting an 8 GB zip
+    once and dispatching to N vaults is N× faster than calling
+    ingest_archive(repo, archive, server_filter=...) N times. The
+    extracted content is read by each per-server snapshot, which only
+    touches its own subdirectory.
+    """
+    from .repo import _read_level_dat_last_played
+    from typing import Callable
+    from .progress import _emit
+
+    archive_path = Path(archive)
+    forced_ts = timestamp.astimezone(timezone.utc) if timestamp else None
+
+    _emit(progress_cb, ProgressEvent(
+        kind="phase_start", phase="ingest_archive",
+        label=archive_path.name,
+    ))
+
+    out: dict[str, IngestResult] = {}
+    with _extract_or_passthrough(archive_path) as extracted:
+        servers = discover_servers_full(extracted)
+        if not servers:
+            raise ImportError(
+                f"{archive_path.name}: no server folders detected"
+            )
+
+        for i, server in enumerate(servers, 1):
+            target_repo = vault_resolver(server.server_name)
+            if target_repo is None:
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_done", phase="server_world",
+                    label=f"{server.server_name} (no vault assigned, skipped)",
+                    current=i, total=len(servers),
+                ))
+                continue
+
+            # Compute server's authoritative ts.
+            if forced_ts is not None:
+                server_ts = forced_ts
+            else:
+                lp_ms = _read_level_dat_last_played(server.world_root)
+                if not lp_ms or lp_ms <= 0:
+                    # Refuse this server (consistent with ingest_archive).
+                    _emit(progress_cb, ProgressEvent(
+                        kind="error", phase="server_world",
+                        label=server.server_name,
+                        detail={"error": "no LastPlayed in level.dat"},
+                    ))
+                    continue
+                server_ts = datetime.fromtimestamp(
+                    lp_ms / 1000, tz=timezone.utc,
+                )
+
+            ts_label = server_ts.strftime("%Y-%m-%d-%H-%M-%S")
+            label = f"{server.server_name}-{ts_label}"
+            result = IngestResult(
+                archive=archive_path, timestamp=server_ts, label=label,
+            )
+
+            # Idempotency on the target vault.
+            existing = target_repo.get(label)
+            if existing is not None:
+                result.already_ingested.append(
+                    (server.server_name, existing.short_id),
+                )
+                try:
+                    target_repo.backfill_region_cache(
+                        server.world_root, existing,
+                        progress_cb=progress_cb,
+                    )
+                except Exception as e:
+                    _emit(progress_cb, ProgressEvent(
+                        kind="warning", phase="backfill_region_cache",
+                        label=f"{server.server_name}: {e}",
+                    ))
+                out[server.server_name] = result
+                continue
+
+            try:
+                snap = target_repo.snapshot(
+                    server.world_root,
+                    label=label,
+                    timestamp=server_ts,
+                    allow_live=True,
+                    verify_roundtrip=verify_roundtrip,
+                    world_name=server.server_name,
+                    progress_cb=progress_cb,
+                )
+                result.snapshots.append(snap)
+                result.server_names.append(server.server_name)
+            except Exception as e:
+                result.skipped_servers.append((server.server_name, str(e)))
+                _emit(progress_cb, ProgressEvent(
+                    kind="error", phase="server_world",
+                    label=server.server_name, detail={"error": str(e)},
+                ))
+                out[server.server_name] = result
+                continue
+
+            # Per-server logs go to that server's own vault.
+            if not skip_logs:
+                files = collect_log_files(server.server_root)
+                if files:
+                    existing_log = target_repo.get_log_snapshot(ts_label)
+                    if existing_log is not None:
+                        result.log_snapshot = existing_log
+                    else:
+                        log_snap = target_repo.add_log_snapshot(
+                            {server.server_name: files},
+                            label=ts_label,
+                            source_path=archive_path,
+                            timestamp=server_ts,
+                        )
+                        result.log_snapshot = log_snap
+
+            out[server.server_name] = result
+
+    _emit(progress_cb, ProgressEvent(
+        kind="finish", phase="ingest_archive",
+        label=archive_path.name,
+        detail={"servers_routed": len(out)},
+    ))
+    return out

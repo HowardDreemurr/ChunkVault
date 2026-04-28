@@ -98,16 +98,15 @@ def test_ingest_flow_runs_through_archives(tmp_path: Path, monkeypatch):
     )
 
     # Answers in the order asked:
-    #   1. repo path           → tmp_path / "repo"
-    #   2. (init? confirm)     → True
-    #   3. (use source path?)  → True
-    #   4. (add another?)      → False
-    #   5. (capture logs?)     → True
-    #   6. (verify each?)      → False (skip — tests don't need the slow path)
-    # (Per-archive selection replaces the old "proceed?" prompt — we mock
-    #  select_archives to accept everything below.)
+    #   1. (per-server vaults?) → False  (single-vault path for this test)
+    #   2. repo path            → tmp_path / "repo"
+    #   3. (init? confirm)      → True
+    #   4. (use source path?)   → True
+    #   5. (add another?)       → False
+    #   6. (capture logs?)      → True
+    #   7. (verify each?)       → False (skip — tests don't need the slow path)
     fake_prompt = FakePrompt([str(repo_path)])
-    fake_confirm = FakeConfirm([True, True, False, True, False])
+    fake_confirm = FakeConfirm([False, True, True, False, True, False])
     monkeypatch.setattr("chunkvault.wizard.flows.prompt_path",
                         lambda c, lbl, **kw: Path(fake_prompt(lbl, default=kw.get("default"))))
     monkeypatch.setattr("chunkvault.wizard.flows.confirm",
@@ -139,8 +138,9 @@ def test_ingest_flow_aborts_when_user_declines(tmp_path: Path, monkeypatch):
     repo_path = tmp_path / "repo"
 
     fake_prompt = FakePrompt([str(repo_path)])
-    # init=yes, use source=yes, add another=no, capture logs=yes, verify=no
-    fake_confirm = FakeConfirm([True, True, False, True, False])
+    # per-server=no, init=yes, use source=yes, add another=no,
+    # capture logs=yes, verify=no
+    fake_confirm = FakeConfirm([False, True, True, False, True, False])
     monkeypatch.setattr("chunkvault.wizard.flows.prompt_path",
                         lambda c, lbl, **kw: Path(fake_prompt(lbl, default=kw.get("default"))))
     monkeypatch.setattr("chunkvault.wizard.flows.confirm",
@@ -162,7 +162,8 @@ def test_ingest_flow_handles_no_sources(tmp_path: Path, monkeypatch):
     repo_path = tmp_path / "repo"
 
     fake_prompt = FakePrompt([str(repo_path)])
-    fake_confirm = FakeConfirm([True, False])  # init=yes, add-another=no
+    # per-server=no, init=yes, add-another=no
+    fake_confirm = FakeConfirm([False, True, False])
     monkeypatch.setattr("chunkvault.wizard.flows.prompt_path",
                         lambda c, lbl, **kw: Path(fake_prompt(lbl, default=kw.get("default"))))
     monkeypatch.setattr("chunkvault.wizard.flows.confirm",

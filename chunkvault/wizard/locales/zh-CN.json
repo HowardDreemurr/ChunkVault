@@ -271,5 +271,16 @@
   "phase.compare_regions.label": "对比 chunk",
   "phase.compare_files.label": "对比非 region 文件",
   "phase.restore_regions.label": "{count} 个 region 文件 → {dest}",
-  "phase.logs.label": "采集日志"
+  "phase.logs.label": "采集日志",
+
+  "prompt.per_server_vaults": "每个服务器一个独立 vault?(多服务器 archive 推荐)",
+  "per_server.no_servers": "选中的 archive 里没检测到 server,没东西可 ingest。",
+  "per_server.found_servers": "在 {archives} 个 archive 里找到 {n} 个不同的 server:",
+  "per_server.no_match_prompt": "没匹配到已注册的 vault。建议路径:{path}",
+  "per_server.create_vault": "为 {server} 创建一个新 vault?",
+  "per_server.skip_server": "{server} 会被跳过 —— 没 vault 可入",
+  "per_server.vault_path_prompt": "{server} 的 vault 路径",
+  "per_server.created": "已创建 → {path}(已注册)",
+  "per_server.no_vaults": "没有可入的 vault —— 已取消。",
+  "per_server.done_summary": "完成。来自 {archives} 个 archive 的 {snaps} 个快照,分入 {vaults} 个 vault。"
 }

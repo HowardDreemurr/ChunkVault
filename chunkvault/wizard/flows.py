@@ -228,7 +228,16 @@ def run_ingest_flow(
         expects=t("flow.ingest.expects"),
         example=t("flow.ingest.example"),
     )
-    repo = _pick_or_create_repo(console, env)
+
+    # New: ask whether each server gets its own vault. Default yes — for
+    # multi-server archives that's the cleaner mental model (one vault per
+    # logical world, no cross-server chunk pool entanglement). Picking no
+    # falls back to the original single-vault behaviour.
+    per_server = confirm(
+        console, t("prompt.per_server_vaults"), default=True,
+    )
+
+    repo = None if per_server else _pick_or_create_repo(console, env)
 
     # Collect candidate source paths
     candidates: list[Path] = []
@@ -308,8 +317,17 @@ def run_ingest_flow(
         return []
     selected_set = {a for a in selected}
     archives = [a for a in archives if a in selected_set]
+    # Keep previews aligned with the (now-filtered) archives list.
+    selected_previews = [p for p in previews if p.path in selected_set]
     console.print(f"[dim]{t('msg.ingesting_count', count=len(archives))}[/dim]")
 
+    if per_server:
+        return _dispatch_per_server_vaults(
+            console, env, archives, selected_previews,
+            skip_logs=skip_logs, verify_after=verify_after,
+        )
+
+    # ── single-vault path (existing behaviour) ─────────────────────────
     results: list[IngestResult] = []
     verify_failures: list[tuple[str, str]] = []     # (archive_name, reason)
     progress = make_progress(console)
@@ -369,6 +387,160 @@ def run_ingest_flow(
         for name, summary in verify_failures[:10]:
             console.print(f"  {name}: {summary}")
     return results
+
+
+def _find_vault_for_server(server_name: str) -> Path | None:
+    """Look up a registered vault that should hold this server's data.
+
+    Match priority:
+      1. Vault whose label exactly equals server_name
+         (set by the wizard when auto-creating a per-server vault)
+      2. Vault whose path basename equals server_name
+         (catches manually-created `F:\\Vaults\\EX-Server\\` style)
+    Returns None if no registered vault fits.
+    """
+    from . import config as _cfg
+    repos = _cfg.list_repos()
+    for r in repos:
+        if r.label == server_name:
+            return r.path
+    for r in repos:
+        if r.path.name == server_name:
+            return r.path
+    return None
+
+
+def _suggest_vault_path_for(server_name: str, env: EnvironmentSummary) -> Path:
+    """Pick a sensible default location for a new per-server vault.
+
+    Preference order:
+      1. <existing_vault.parent>/<server_name>  — same parent as any
+         already-registered vault, so per-server vaults sit together
+      2. <cwd>/Vaults/<server_name>             — fresh-start fallback
+    """
+    from . import config as _cfg
+    for r in _cfg.list_repos():
+        if r.path.is_dir() and r.path.parent.is_dir():
+            return r.path.parent / server_name
+    return Path.cwd() / "Vaults" / server_name
+
+
+def _dispatch_per_server_vaults(
+    console: Console, env: EnvironmentSummary,
+    archives: list[Path], previews: list,
+    *, skip_logs: bool, verify_after: bool,
+) -> list[IngestResult]:
+    """Each server in the selected archives gets its own dedicated vault.
+
+    UX: aggregate the unique server names from the previews, match them
+    against the registered-vault list (label match → basename match),
+    prompt the user to create a new vault for any unmatched server.
+    Then ingest each archive ONCE (single extraction), routing each
+    server's data to its assigned vault.
+    """
+    from ..store.ingest import ingest_archive_per_server_vaults
+    from . import config as _cfg
+
+    # Aggregate unique server names across previews
+    unique_servers: set[str] = set()
+    for p in previews:
+        if p.error is None:
+            for s in p.servers:
+                unique_servers.update([s.name])
+
+    if not unique_servers:
+        console.print(f"[yellow]{t('per_server.no_servers')}[/yellow]")
+        return []
+
+    console.print(
+        f"\n[bold]{t('per_server.found_servers', n=len(unique_servers), archives=len(archives))}[/bold]"
+    )
+
+    # Resolve each server to a vault: registered match, or prompt-create.
+    server_to_repo: dict[str, ChunkSnapshotRepo] = {}
+    for server_name in sorted(unique_servers):
+        existing = _find_vault_for_server(server_name)
+        if existing is not None:
+            console.print(
+                f"  [green]✓[/green] {server_name} → [dim]{existing}[/dim]"
+            )
+            try:
+                repo = ChunkSnapshotRepo(existing)
+                if not repo.is_initialized():
+                    console.print(
+                        f"    [yellow]registered vault not initialized — initializing[/yellow]"
+                    )
+                    repo.init()
+                server_to_repo[server_name] = repo
+            except Exception as e:
+                console.print(f"    [red]error opening vault: {e}[/red]")
+            continue
+
+        # Unmatched — offer to create
+        suggested = _suggest_vault_path_for(server_name, env)
+        console.print(
+            f"  [yellow]?[/yellow] {server_name}: "
+            f"{t('per_server.no_match_prompt', path=suggested)}"
+        )
+        if not confirm(
+            console, t("per_server.create_vault", server=server_name),
+            default=True,
+        ):
+            console.print(
+                f"    [dim]{t('per_server.skip_server', server=server_name)}[/dim]"
+            )
+            continue
+        # Allow the user to override the suggested path
+        chosen = prompt_path(
+            console, t("per_server.vault_path_prompt", server=server_name),
+            default=suggested, must_exist=False,
+        )
+        repo = ChunkSnapshotRepo(chosen)
+        if not repo.is_initialized():
+            repo.init()
+        _cfg.add_repo(chosen, label=server_name)
+        console.print(
+            f"    [green]{t('per_server.created', path=chosen)}[/green]"
+        )
+        server_to_repo[server_name] = repo
+
+    if not server_to_repo:
+        console.print(f"[yellow]{t('per_server.no_vaults')}[/yellow]")
+        return []
+
+    def vault_resolver(server_name: str) -> ChunkSnapshotRepo | None:
+        return server_to_repo.get(server_name)
+
+    # Now do the ingest
+    all_results: list[IngestResult] = []
+    progress = make_progress(console)
+    with progress:
+        archive_task = progress.add_task("archives", total=len(archives))
+        phase_task = progress.add_task("phase: idle", total=None)
+        cb = _make_phase_cb(progress, phase_task, prefix="phase")
+
+        for archive in archives:
+            progress.update(archive_task, description=f"archives: {archive.name}")
+            try:
+                results_by_server = ingest_archive_per_server_vaults(
+                    archive, vault_resolver,
+                    skip_logs=skip_logs,
+                    verify_roundtrip=verify_after,
+                    progress_cb=cb,
+                )
+                all_results.extend(results_by_server.values())
+            except Exception as e:
+                console.print(f"[red]error[/red] {archive.name}: {e}")
+            progress.advance(archive_task, 1)
+
+    total_snaps = sum(len(r.snapshots) for r in all_results)
+    total_already = sum(len(r.already_ingested) for r in all_results)
+    console.print(
+        f"\n[green]{t('per_server.done_summary', snaps=total_snaps, vaults=len(server_to_repo), archives=len(archives))}[/green]"
+    )
+    if total_already:
+        console.print(f"[dim]{t('msg.already_in_vault', count=total_already)}[/dim]")
+    return all_results
 
 
 # ---- single snapshot ----------------------------------------------------
