@@ -1901,37 +1901,33 @@ class ChunkSnapshotRepo:
                 kind="phase_progress", phase="repair_apply",
                 current=applied,
             ))
-        for plan in report.to_retime:
-            try:
-                new_ts = datetime.fromtimestamp(
-                    plan.new_ts_ms / 1000, tz=timezone.utc,
-                )
-                self.retime_snapshot(plan.snap_id, new_ts)
-                if plan.new_label != plan.old_label:
-                    self._rename_snapshot_label(plan.snap_id, plan.new_label)
-                # Persist recovered LP to the manifest header so subsequent
-                # repair-timestamps runs see it directly without re-pulling
-                # from the file pool.
-                lp = recovered_for.get(plan.snap_id)
-                if lp is not None:
-                    self._persist_last_played_ms(plan.snap_id, lp)
-                report.retimed.append(plan.snap_id)
-            except Exception as e:
-                report.errors.append(("retime", plan.snap_id, str(e)))
-            applied += 1
-            _emit(progress_cb, ProgressEvent(
-                kind="phase_progress", phase="repair_apply",
-                current=applied,
-            ))
-        # Already-correct snapshots can also have their recovered LP persisted
-        # for the same reason (so future repair runs are O(scan) only).
-        for snap_id, lp in recovered_for.items():
-            if snap_id in [p.snap_id for p in report.to_retime]:
-                continue   # already handled above
-            try:
-                self._persist_last_played_ms(snap_id, lp)
-            except Exception as e:
-                report.errors.append(("persist_lp", snap_id, str(e)))
+        # Hold one IndexDB connection across the whole apply loop instead
+        # of opening/closing per snapshot — for vaults with hundreds of
+        # snapshots, the connection setup cost dominated.
+        retime_plan_ids = {p.snap_id for p in report.to_retime}
+        with IndexDB(self.index_path) as index:
+            for plan in report.to_retime:
+                try:
+                    self._apply_retime_plan(
+                        plan, recovered_for.get(plan.snap_id), index,
+                    )
+                    report.retimed.append(plan.snap_id)
+                except Exception as e:
+                    report.errors.append(("retime", plan.snap_id, str(e)))
+                applied += 1
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="repair_apply",
+                    current=applied,
+                ))
+            # Already-correct snapshots whose LP we recovered: persist it
+            # so subsequent repair runs are scan-only (no re-pull from pool).
+            for snap_id, lp in recovered_for.items():
+                if snap_id in retime_plan_ids:
+                    continue
+                try:
+                    self._persist_last_played_ms_with_index(snap_id, lp, index)
+                except Exception as e:
+                    report.errors.append(("persist_lp", snap_id, str(e)))
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="repair_apply",
             current=applied,
@@ -2234,13 +2230,85 @@ class ChunkSnapshotRepo:
 
     def _persist_last_played_ms(self, snap_id: str, lp_ms: int) -> None:
         """Write a recovered ``last_played_ms`` into the manifest header so
-        future repair runs see it pre-recorded."""
+        future repair runs see it pre-recorded. Convenience wrapper that
+        opens its own IndexDB; prefer the ``_with_index`` variant inside
+        a loop so the connection isn't recreated per call."""
+        with IndexDB(self.index_path) as index:
+            self._persist_last_played_ms_with_index(snap_id, lp_ms, index)
+
+    def _persist_last_played_ms_with_index(
+        self, snap_id: str, lp_ms: int, index: "IndexDB",
+    ) -> None:
         snap = self.get(snap_id)
         if snap is None:
             raise ChunkRepoError(f"snapshot vanished mid-repair: {snap_id}")
         manifest = read_manifest(snap.manifest_path)
         manifest.header.last_played_ms = lp_ms
         write_manifest(snap.manifest_path, manifest)
+
+    def _apply_retime_plan(
+        self, plan: "RetimePlan", recovered_lp: int | None,
+        index: "IndexDB",
+    ) -> None:
+        """Apply timestamp + label + recovered-LP changes to one snapshot
+        in a SINGLE manifest read+write, instead of three separate cycles.
+
+        For vaults with multi-hundred-MB manifests, doing one I/O pass
+        instead of three is a 3x throughput win on apply. The previous
+        implementation called retime_snapshot, _rename_snapshot_label, and
+        _persist_last_played_ms in sequence — each opened the manifest,
+        edited a field, wrote it back, opened a SQLite connection.
+        """
+        snap = self.get(plan.snap_id)
+        if snap is None:
+            raise ChunkRepoError(
+                f"snapshot vanished mid-repair: {plan.snap_id}"
+            )
+        if not snap.manifest_path.is_file():
+            raise ChunkRepoError(
+                f"manifest missing for {snap.short_id}: {snap.manifest_path}"
+            )
+
+        manifest = read_manifest(snap.manifest_path)
+        old_ts_ms = manifest.header.timestamp_ms
+        new_ts_ms = plan.new_ts_ms
+
+        # Collision check: refuse if another snapshot already sits at this
+        # exact (label, timestamp). Same logic as retime_snapshot — we just
+        # also need to consider the new label, since repair may rename.
+        check_label = plan.new_label or plan.old_label
+        existing_id = index.find_snapshot_by_label_and_timestamp(
+            check_label, new_ts_ms,
+        )
+        if existing_id is not None and existing_id != plan.snap_id:
+            raise ChunkRepoError(
+                f"refusing retime: {existing_id[:12]} already at "
+                f"label={check_label!r} timestamp_ms={new_ts_ms}"
+            )
+
+        first_retime = manifest.header.original_timestamp_ms == 0
+        new_original = (
+            old_ts_ms if first_retime else manifest.header.original_timestamp_ms
+        )
+
+        # Apply all changes in memory
+        manifest.header.timestamp_ms = new_ts_ms
+        manifest.header.original_timestamp_ms = new_original
+        if plan.new_label != plan.old_label:
+            manifest.header.label = plan.new_label
+        if recovered_lp is not None:
+            manifest.header.last_played_ms = recovered_lp
+
+        # Single atomic write
+        write_manifest(snap.manifest_path, manifest)
+
+        # Index updates (single connection, batched)
+        index.update_snapshot_timestamp(
+            plan.snap_id, new_ts_ms,
+            original_timestamp_ms=new_original if first_retime else None,
+        )
+        if plan.new_label != plan.old_label:
+            index.update_snapshot_label(plan.snap_id, plan.new_label)
 
     def _rename_snapshot_label(self, snap_id: str, new_label: str) -> None:
         """Persist a label rename to both the manifest header and the index
