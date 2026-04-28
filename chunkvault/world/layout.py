@@ -55,7 +55,20 @@ def enumerate_region_dirs(world_root: Path | str) -> list[RegionDir]:
 
 
 def _find_region_dirs(root: Path, max_depth: int) -> Iterator[Path]:
-    """Yield directories named 'region' that contain at least one .mca file."""
+    """Yield directories that contain at least one r.X.Z.mca file.
+
+    MC stores region-format data in three known places per world tree:
+    ``region/`` (block data), ``entities/`` (1.17+ mob/item data), and
+    ``poi/`` (1.14+ village + portal points). Plus per-dimension
+    variants (``DIM-1/entities/``, ``world_nether/poi/``, etc.).
+
+    Rather than maintaining a name list — easy to forget a variant when
+    Mojang adds a new one, or when a mod introduces its own region-style
+    pool — we treat any directory containing ``r.X.Z.mca`` files as a
+    region-style dir. That uniformly enables chunk-level dedup across
+    all of MC's vanilla region pools and is forward-compatible with
+    future format additions.
+    """
     stack: list[tuple[Path, int]] = [(root, 0)]
     while stack:
         current, depth = stack.pop()
@@ -63,25 +76,26 @@ def _find_region_dirs(root: Path, max_depth: int) -> Iterator[Path]:
             children = list(current.iterdir())
         except (PermissionError, OSError):
             continue
+        # Probe THIS dir: does it contain r.X.Z.mca files?
+        try:
+            has_mca = any(
+                child.is_file()
+                and parse_region_filename(child) is not None
+                for child in children
+            )
+        except (PermissionError, OSError):
+            has_mca = False
+        if has_mca:
+            yield current
+            # A region-style dir doesn't itself contain nested region-style
+            # dirs — stop descending.
+            continue
+        # Otherwise descend into subdirs
         for child in children:
             try:
                 if not child.is_dir():
                     continue
             except OSError:
-                continue
-            if child.name == "region":
-                # Verify it has at least one region file
-                try:
-                    has_mca = any(
-                        f.is_file()
-                        and parse_region_filename(f) is not None
-                        for f in child.iterdir()
-                    )
-                except (PermissionError, OSError):
-                    has_mca = False
-                if has_mca:
-                    yield child
-                # Don't descend further — a region/ dir doesn't have nested regions
                 continue
             if depth + 1 < max_depth:
                 stack.append((child, depth + 1))

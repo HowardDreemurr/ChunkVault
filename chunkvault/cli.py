@@ -674,6 +674,30 @@ def cmd_repair_timestamps(args: argparse.Namespace) -> int:
     return 0 if not report.errors else 1
 
 
+def cmd_migrate_mca_files(args: argparse.Namespace) -> int:
+    """Move MCA files (entities/, poi/) from whole-file dedup to chunk dedup.
+
+    Snapshots taken before chunkvault recognised entities/ and poi/ as
+    region-style dirs put their .mca files into manifest.files (whole-
+    file deduped). This rewrites those manifests to chunk-dedupe them
+    using the bytes already in the file pool — no source archive needed.
+
+    Default is dry-run; pass --apply to actually rewrite.
+    """
+    from .store import ChunkSnapshotRepo
+    repo = ChunkSnapshotRepo(args.repo)
+    report = repo.migrate_mca_files_to_chunks(dry_run=not args.apply)
+    print(report.summary())
+    if report.errors:
+        print(f"\n# {len(report.errors)} error(s):", file=sys.stderr)
+        for op, sid, msg in report.errors[:20]:
+            print(f"  [{op}] {sid[:12]}: {msg}", file=sys.stderr)
+    if not args.apply and report.mca_files_total:
+        print(f"\n# this was a DRY RUN — re-run with --apply to actually "
+              f"rewrite manifests.")
+    return 0 if not report.errors else 1
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     repo = _open_repo(args)
     for snap in repo.list():
@@ -923,6 +947,20 @@ def build_parser() -> argparse.ArgumentParser:
              "this flag, only a report is printed (DRY RUN).",
     )
     rp.set_defaults(func=cmd_repair_timestamps)
+
+    mm = sub.add_parser(
+        "migrate-mca-files",
+        help="Move entities/*.mca + poi/*.mca from whole-file dedup to "
+             "chunk-level dedup, rewriting existing manifests using the "
+             "bytes already in the file pool. Default is dry-run.",
+    )
+    mm.add_argument("repo", type=Path)
+    mm.add_argument(
+        "--apply", action="store_true",
+        help="Actually rewrite manifests + adjust ref counts. Without "
+             "this flag, only a report is printed (DRY RUN).",
+    )
+    mm.set_defaults(func=cmd_migrate_mca_files)
 
     ll = sub.add_parser("logs-list", help="List log snapshots.")
     ll.add_argument("repo", type=Path)

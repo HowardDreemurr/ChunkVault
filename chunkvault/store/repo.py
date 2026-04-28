@@ -219,6 +219,38 @@ class RepairReport:
 
 
 @dataclass
+class MigrateMcaReport:
+    """Result of :meth:`ChunkSnapshotRepo.migrate_mca_files_to_chunks`."""
+    scanned: int = 0
+    snapshots_with_mca_files: int = 0
+    mca_files_total: int = 0
+    unreadable: list[tuple[str, str]] = field(default_factory=list)  # (id, err)
+    # Populated when dry_run=False:
+    applied: bool = False
+    snapshots_rewritten: int = 0
+    files_migrated: int = 0
+    chunks_added: int = 0
+    skipped_external: int = 0
+    errors: list[tuple[str, str, str]] = field(default_factory=list)  # (op, id, msg)
+
+    def summary(self) -> str:
+        verdict = (
+            "APPLIED" if self.applied else
+            ("CLEAN" if self.mca_files_total == 0 else "DRY-RUN")
+        )
+        return (
+            f"{verdict}  scanned={self.scanned}, "
+            f"snaps_with_mca_files={self.snapshots_with_mca_files}, "
+            f"files_total={self.mca_files_total}, "
+            f"files_migrated={self.files_migrated}, "
+            f"chunks_added={self.chunks_added}, "
+            f"snaps_rewritten={self.snapshots_rewritten}, "
+            f"skipped_external={self.skipped_external}, "
+            f"errors={len(self.errors)}"
+        )
+
+
+@dataclass
 class BackfillStats:
     """Counts returned from :meth:`ChunkSnapshotRepo.backfill_region_cache`."""
     written: int = 0
@@ -1903,6 +1935,229 @@ class ChunkSnapshotRepo:
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="repair_apply",
             current=applied,
+        ))
+
+        report.applied = True
+        return report
+
+    def migrate_mca_files_to_chunks(
+        self, *,
+        dry_run: bool = True,
+        progress_cb: ProgressCallback = None,
+    ) -> "MigrateMcaReport":
+        """Retroactively chunk-dedupe MCA files that were stored as
+        whole-files in older snapshots.
+
+        Snapshots taken before :func:`enumerate_region_dirs` recognised
+        ``entities/`` and ``poi/`` as region-style dirs put those .mca
+        files into ``manifest.files`` (whole-file dedup, sha256-keyed).
+        That works but misses chunk-level dedup, so every save stored a
+        full new copy of files that change every tick (mob movement,
+        villager pathfinding) — easily GB of waste over a long timeline.
+
+        This tool walks every snapshot's manifest, finds file entries
+        whose basename is ``r.X.Z.mca``, pulls the bytes out of the file
+        pool, parses them as a region, hashes the chunks, writes new
+        chunks to the chunk pool, and rewrites the manifest:
+
+        * Each migrated entry moves from ``manifest.files`` to
+          ``manifest.dimensions[<derived_dim_key>]``.
+        * The dim_key is derived from the file's relative path:
+          ``entities/r.0.0.mca`` → ``entities``;
+          ``world_nether/poi/r.0.0.mca`` → ``world_nether/poi``.
+        * Ref counts: file refs -1 (whole-file blobs become eligible for
+          gc); chunk refs +1 per newly-referenced chunk hash.
+
+        Existing chunk-deduped dimensions (e.g. ``region``) are
+        untouched. Snapshots whose entire ``files`` list lacks any
+        ``r.X.Z.mca`` entry are noops.
+
+        With ``dry_run=True`` (default), nothing is modified — only a
+        plan is produced. ``dry_run=False`` applies the plan.
+        """
+        from ..mca.region import Region, MCAError, EXTERNAL_FLAG
+        from ..mca.hasher import hash_chunk
+        from pathlib import PurePosixPath
+
+        report = MigrateMcaReport()
+        all_snaps = self.list()
+        report.scanned = len(all_snaps)
+
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="migrate_mca_scan",
+            label=f"reading {len(all_snaps)} manifests",
+            total=len(all_snaps),
+        ))
+
+        # Per-snapshot plan: list of (FileRecord, dim_key, rx, rz)
+        plans: dict[str, list[tuple]] = {}     # snap_id -> [(file_rec, dim_key, rx, rz, region_bytes_sha)]
+        for i, snap in enumerate(all_snaps, 1):
+            try:
+                manifest = read_manifest(snap.manifest_path)
+            except Exception as e:
+                report.unreadable.append((snap.id, str(e)))
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="migrate_mca_scan",
+                    current=i, total=len(all_snaps),
+                ))
+                continue
+
+            entries: list[tuple] = []
+            for fr in manifest.files:
+                pp = PurePosixPath(fr.relative_path)
+                # parse "r.X.Z.mca" pattern
+                parts = pp.name.split(".")
+                if len(parts) != 4 or parts[0] != "r" or parts[3] not in ("mca", "mcr"):
+                    continue
+                try:
+                    rx, rz = int(parts[1]), int(parts[2])
+                except ValueError:
+                    continue
+                # dim_key = parent directory path; "" if at root
+                parent_posix = "/".join(pp.parts[:-1])
+                if not parent_posix:
+                    continue   # bare r.X.Z.mca at world root; skip (unusual)
+                entries.append((fr, parent_posix, rx, rz))
+            if entries:
+                plans[snap.id] = entries
+                report.snapshots_with_mca_files += 1
+                report.mca_files_total += len(entries)
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_progress", phase="migrate_mca_scan",
+                current=i, total=len(all_snaps),
+            ))
+
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="migrate_mca_scan",
+            current=len(all_snaps), total=len(all_snaps),
+        ))
+
+        if dry_run or not plans:
+            return report
+
+        # Apply: for each snapshot's plan, parse + hash + rewrite manifest
+        snaps_by_id = {s.id: s for s in all_snaps}
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="migrate_mca_apply",
+            label=f"migrating {report.mca_files_total} files across "
+                  f"{report.snapshots_with_mca_files} snapshots",
+            total=report.mca_files_total,
+        ))
+        applied = 0
+        with IndexDB(self.index_path) as index:
+            for snap_id, entries in plans.items():
+                snap = snaps_by_id[snap_id]
+                try:
+                    manifest = read_manifest(snap.manifest_path)
+                except Exception as e:
+                    report.errors.append(("read_manifest", snap_id, str(e)))
+                    applied += len(entries)
+                    continue
+
+                # New dim records to add to this manifest, grouped by dim_key
+                new_dims: dict[str, list[RegionRecord]] = {}
+                old_file_shas_to_remove: list[bytes] = []
+                new_chunk_hashes: list[bytes] = []   # ref-count delta input
+
+                for fr, dim_key, rx, rz in entries:
+                    blob = self.chunks.read_file(fr.sha256)
+                    if blob is None:
+                        report.errors.append((
+                            "read_blob", snap_id,
+                            f"file pool missing {fr.sha256.hex()[:16]} "
+                            f"({fr.relative_path})",
+                        ))
+                        applied += 1
+                        continue
+                    try:
+                        region = Region.from_bytes(blob, rx=rx, rz=rz,
+                                                   source=fr.relative_path)
+                        chunks_iter = list(region.iter_chunks())
+                    except MCAError as e:
+                        report.errors.append((
+                            "parse_mca", snap_id,
+                            f"{fr.relative_path}: {e}",
+                        ))
+                        applied += 1
+                        continue
+
+                    rec = RegionRecord(rx=rx, rz=rz, chunks=[])
+                    for chunk in chunks_iter:
+                        if chunk.external:
+                            # entities/poi MCAs effectively never use external
+                            # chunks (they're metadata, not block payloads),
+                            # but be safe: skip the migration of this region
+                            # if any external chunk appears.
+                            report.skipped_external += 1
+                            rec = None
+                            break
+                        payload = chunk.payload
+                        h = hash_chunk(chunk)
+                        masked = chunk.compression & ~EXTERNAL_FLAG
+                        chunk_blob = bytes([masked]) + payload
+                        if not self.chunks.has_chunk(h):
+                            self.chunks.store_chunk(h, chunk_blob)
+                        rec.chunks.append(ChunkRecord(
+                            cx=chunk.cx, cz=chunk.cz,
+                            compression=chunk.compression,
+                            timestamp=chunk.timestamp,
+                            content_hash=h,
+                        ))
+                        new_chunk_hashes.append(h)
+                    if rec is None:
+                        applied += 1
+                        continue
+
+                    new_dims.setdefault(dim_key, []).append(rec)
+                    old_file_shas_to_remove.append(fr.sha256)
+                    report.files_migrated += 1
+                    report.chunks_added += len(rec.chunks)
+
+                    applied += 1
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="migrate_mca_apply",
+                        label=f"{snap.short_id}: {fr.relative_path}",
+                        current=applied,
+                    ))
+
+                # Commit the manifest rewrite atomically: replace files with
+                # their dimension records, then index ref-count adjustments.
+                try:
+                    # Merge new dim records into the existing manifest.
+                    for dim_key, recs in new_dims.items():
+                        manifest.dimensions.setdefault(dim_key, []).extend(recs)
+                    # Drop migrated files from the files list.
+                    removed_set = set(old_file_shas_to_remove)
+                    manifest.files = [
+                        f for f in manifest.files if f.sha256 not in removed_set
+                    ]
+                    write_manifest(snap.manifest_path, manifest)
+                    # Index updates: chunk presence + refs, file refs.
+                    if new_chunk_hashes:
+                        index.add_chunks(list({h for h in new_chunk_hashes}))
+                        index.adjust_chunk_refs(new_chunk_hashes, delta=+1)
+                    if old_file_shas_to_remove:
+                        index.adjust_file_refs(old_file_shas_to_remove, delta=-1)
+                    # Update snapshot row's chunk_count / file_count to match.
+                    new_chunk_count = sum(
+                        len(r.chunks)
+                        for rs in manifest.dimensions.values()
+                        for r in rs
+                    )
+                    new_file_count = len(manifest.files)
+                    index._conn.execute(
+                        "UPDATE snapshots SET chunk_count = ?, file_count = ? "
+                        "WHERE id = ?",
+                        (new_chunk_count, new_file_count, snap_id),
+                    )
+                    index._conn.commit()
+                    report.snapshots_rewritten += 1
+                except Exception as e:
+                    report.errors.append(("commit", snap_id, str(e)))
+
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="migrate_mca_apply",
+            current=applied, total=report.mca_files_total,
         ))
 
         report.applied = True
