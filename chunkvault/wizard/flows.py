@@ -18,6 +18,7 @@ from ..store import (
     iter_archives,
 )
 from ..store.ingest import IngestResult
+from .._timefmt import format_local as _fmt_ts
 from .detect import EnvironmentSummary, detect_environment, summarize_repo
 from .i18n import t
 from .ui import (
@@ -100,8 +101,7 @@ def run_wizard(console: Console | None = None) -> int:
     render_environment(console, env)
     if not env.repos and not env.source_paths:
         console.print(
-            "[yellow]Nothing auto-detected. You can still proceed — "
-            "the wizard will prompt you for paths to use.[/yellow]\n"
+            f"[yellow]{_t('msg.nothing_auto_detected')}[/yellow]\n"
         )
 
     first_loop = True
@@ -148,8 +148,7 @@ def run_wizard(console: Console | None = None) -> int:
             env = detect_environment()
         except Exception as e:
             console.print(
-                f"[dim red]({_t('prompt.error')} env refresh: {e}; "
-                f"keeping previous environment.)[/dim red]"
+                f"[dim red]{_t('msg.env_refresh_failed', err=e)}[/dim red]"
             )
 
 
@@ -171,7 +170,7 @@ def _pick_snapshot(
         console.print(f"[yellow]{t('msg.empty_vault')}[/yellow]")
         return None
     options = [
-        f"{s.short_id}  {s.timestamp.isoformat()}  {(s.label or '-')[:40]}"
+        f"{s.short_id}  {_fmt_ts(s.timestamp)}  {(s.label or '-')[:40]}"
         for s in snaps
     ]
     pick = choose_one(console, prompt, options)
@@ -192,7 +191,7 @@ def _pick_log_snapshot(
         console.print(f"[yellow]{t('msg.empty_log_snaps')}[/yellow]")
         return None
     options = [
-        f"{s.short_id}  {s.timestamp.isoformat()}  {(s.label or '-'):26}  "
+        f"{s.short_id}  {_fmt_ts(s.timestamp)}  {(s.label or '-'):26}  "
         f"servers={s.server_count} files={s.file_count}"
         for s in snaps
     ]
@@ -333,21 +332,23 @@ def run_ingest_flow(
     progress = make_progress(console)
     from ..store.repo import RoundTripVerificationError
     with progress:
-        archive_task = progress.add_task("archives", total=len(archives))
+        archive_task = progress.add_task(t("task.archives"), total=len(archives))
         # A second task that follows the active phase inside the current
         # archive (regions/files/verify). Without this the outer bar sits at
         # 0/N for the entire first archive — a single 2 GB zip can take 10+
         # minutes, and a frozen-looking progress bar makes users think
         # the wizard hung.
-        phase_task = progress.add_task("phase: idle", total=None)
+        phase_task = progress.add_task(t("task.phase_idle"), total=None)
 
         def make_cb():
             return _make_phase_cb(progress, phase_task, prefix="phase")
 
         for archive in archives:
-            progress.update(archive_task, description=f"archives: {archive.name}")
+            progress.update(archive_task,
+                            description=t("task.archives_named", name=archive.name))
             progress.update(
-                phase_task, description=f"phase: opening {archive.name}",
+                phase_task,
+                description=t("task.phase_opening", name=archive.name),
                 completed=0, total=None,
             )
             try:
@@ -361,15 +362,15 @@ def run_ingest_flow(
             except RoundTripVerificationError as e:
                 verify_failures.append((archive.name, e.report.summary()))
                 console.print(
-                    f"[red]VERIFY FAILED[/red] {archive.name}: "
+                    f"[red]{t('msg.verify_failed_inline')}[/red] {archive.name}: "
                     f"{e.report.summary()}"
                 )
             except ImportError as e:
-                console.print(f"[red]skip[/red] {archive.name}: {e}")
+                console.print(f"[red]{t('msg.tag.skip')}[/red] {archive.name}: {e}")
             except Exception as e:
-                console.print(f"[red]error[/red] {archive.name}: {e}")
+                console.print(f"[red]{t('msg.tag.error')}[/red] {archive.name}: {e}")
             progress.advance(archive_task, 1)
-        progress.update(phase_task, description="phase: done", completed=1, total=1)
+        progress.update(phase_task, description=t("task.phase_done"), completed=1, total=1)
 
     # Summary
     snaps = sum(len(r.snapshots) for r in results)
@@ -468,12 +469,12 @@ def _dispatch_per_server_vaults(
                 repo = ChunkSnapshotRepo(existing)
                 if not repo.is_initialized():
                     console.print(
-                        f"    [yellow]registered vault not initialized — initializing[/yellow]"
+                        f"    [yellow]{t('per_server.vault_not_init')}[/yellow]"
                     )
                     repo.init()
                 server_to_repo[server_name] = repo
             except Exception as e:
-                console.print(f"    [red]error opening vault: {e}[/red]")
+                console.print(f"    [red]{t('per_server.vault_open_error', err=e)}[/red]")
             continue
 
         # Unmatched — offer to create
@@ -515,12 +516,13 @@ def _dispatch_per_server_vaults(
     all_results: list[IngestResult] = []
     progress = make_progress(console)
     with progress:
-        archive_task = progress.add_task("archives", total=len(archives))
-        phase_task = progress.add_task("phase: idle", total=None)
+        archive_task = progress.add_task(t("task.archives"), total=len(archives))
+        phase_task = progress.add_task(t("task.phase_idle"), total=None)
         cb = _make_phase_cb(progress, phase_task, prefix="phase")
 
         for archive in archives:
-            progress.update(archive_task, description=f"archives: {archive.name}")
+            progress.update(archive_task,
+                            description=t("task.archives_named", name=archive.name))
             try:
                 results_by_server = ingest_archive_per_server_vaults(
                     archive, vault_resolver,
@@ -530,7 +532,7 @@ def _dispatch_per_server_vaults(
                 )
                 all_results.extend(results_by_server.values())
             except Exception as e:
-                console.print(f"[red]error[/red] {archive.name}: {e}")
+                console.print(f"[red]{t('msg.tag.error')}[/red] {archive.name}: {e}")
             progress.advance(archive_task, 1)
 
     total_snaps = sum(len(r.snapshots) for r in all_results)
@@ -560,7 +562,7 @@ def run_snapshot_flow(console: Console, env: EnvironmentSummary):
     progress = make_progress(console)
     from ..store.repo import RoundTripVerificationError
     with progress:
-        task = progress.add_task("snapshot", total=None)
+        task = progress.add_task(t("task.snapshot"), total=None)
         cb = _make_phase_cb(progress, task, prefix="snapshot")
 
         try:
@@ -594,7 +596,7 @@ def run_diff_flow(console: Console, env: EnvironmentSummary):
         return
     console.print(f"\n[bold]{t('msg.snapshots_header')}[/bold]")
     for s in snaps[:20]:
-        console.print(f"  {s.short_id}  {s.timestamp.isoformat()}  "
+        console.print(f"  {s.short_id}  {_fmt_ts(s.timestamp)}  "
                       f"{s.label or '-':25}  ({s.world_name})")
     a = console.input(t("prompt.snap_a")).strip()
     b = console.input(t("prompt.snap_b")).strip()
@@ -622,14 +624,14 @@ def run_list_flow(console: Console, env: EnvironmentSummary):
     log_snaps = repo.list_log_snapshots()
     console.print(f"\n[bold]{t('msg.world_snaps_header', count=len(snaps))}[/bold]")
     for s in snaps[:50]:
-        console.print(f"  {s.short_id}  {s.timestamp.isoformat()}  "
+        console.print(f"  {s.short_id}  {_fmt_ts(s.timestamp)}  "
                       f"{s.label or '-':25}  world={s.world_name}  "
                       f"mc={s.mc_version or '?'}")
     if len(snaps) > 50:
         console.print(t("msg.more_snaps", n=len(snaps) - 50))
     console.print(f"\n[bold]{t('msg.log_snaps_header', count=len(log_snaps))}[/bold]")
     for s in log_snaps[:50]:
-        console.print(f"  {s.short_id}  {s.timestamp.isoformat()}  "
+        console.print(f"  {s.short_id}  {_fmt_ts(s.timestamp)}  "
                       f"{s.label or '-':25}  servers={s.server_count}  "
                       f"files={s.file_count}")
 
@@ -646,7 +648,7 @@ def run_verify_flow(console: Console, env: EnvironmentSummary):
     repair = confirm(console, t("prompt.repair_blobs"), default=False)
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("verify: idle", total=None)
+        task = progress.add_task(t("task.verify_idle"), total=None)
         cb = _make_phase_cb(progress, task, prefix="verify")
         report = repo.verify(repair=repair, progress_cb=cb)
     console.print(t(
@@ -686,7 +688,7 @@ def run_fsck_flow(console: Console, env: EnvironmentSummary):
     dry_run = confirm(console, t("prompt.fsck_dryrun"), default=False)
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("fsck", total=None)
+        task = progress.add_task(t("task.fsck"), total=None)
         cb = _make_phase_cb(progress, task, prefix="fsck")
         report = repo.fsck(repair=not dry_run, progress_cb=cb)
     if report.clean:
@@ -718,7 +720,7 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
     # bar so it doesn't look like the wizard hung.
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("repair: scanning", total=None)
+        task = progress.add_task(t("task.repair_scanning"), total=None)
         cb = _make_phase_cb(progress, task, prefix="repair")
         dry = repo.repair_timestamps(dry_run=True, progress_cb=cb)
     console.print(f"[bold]{dry.summary()}[/bold]")
@@ -744,9 +746,9 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
             f"\n[bold]{t('flow.repair_ts.dup_groups_header', count=len(dry.duplicate_groups))}[/bold]"
         )
         for g in dry.duplicate_groups[:10]:
-            ts_iso = datetime.fromtimestamp(
+            ts_iso = _fmt_ts(datetime.fromtimestamp(
                 g.target_ts_ms / 1000, tz=timezone.utc,
-            ).isoformat()
+            ))
             console.print(f"  [cyan]{g.world_name}[/cyan] @ {ts_iso}")
             console.print(t("flow.repair_ts.dup_keep", sid=g.winner_id[:12]))
             for lid in g.loser_ids:
@@ -760,12 +762,12 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
             f"\n[bold]{t('flow.repair_ts.retime_header', count=len(dry.to_retime))}[/bold]"
         )
         for plan in dry.to_retime[:10]:
-            old_iso = datetime.fromtimestamp(
+            old_iso = _fmt_ts(datetime.fromtimestamp(
                 plan.old_ts_ms / 1000, tz=timezone.utc,
-            ).isoformat()
-            new_iso = datetime.fromtimestamp(
+            ))
+            new_iso = _fmt_ts(datetime.fromtimestamp(
                 plan.new_ts_ms / 1000, tz=timezone.utc,
-            ).isoformat()
+            ))
             label_part = (
                 f"  [dim]label: {plan.old_label!r} → {plan.new_label!r}[/dim]"
                 if plan.new_label != plan.old_label else ""
@@ -789,7 +791,7 @@ def run_repair_timestamps_flow(console: Console, env: EnvironmentSummary):
 
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("repair: applying", total=None)
+        task = progress.add_task(t("task.repair_applying"), total=None)
         cb = _make_phase_cb(progress, task, prefix="repair")
         result = repo.repair_timestamps(dry_run=False, progress_cb=cb)
     console.print(f"[green]{result.summary()}[/green]")
@@ -819,7 +821,7 @@ def run_restore_flow(console: Console, env: EnvironmentSummary):
             return
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("restore", total=None)
+        task = progress.add_task(t("task.restore"), total=None)
         cb = _make_phase_cb(progress, task, prefix="phase")
         repo.restore(snap, dest, progress_cb=cb)
     console.print(f"[green]{t('msg.restore.done', sid=snap.short_id, dest=dest)}[/green]")
@@ -865,12 +867,12 @@ def run_retime_flow(console: Console, env: EnvironmentSummary):
             console.print(f"[yellow]{t('msg.retime.no_lp')}[/yellow]")
             return
         console.print(
-            f"[green]{t('msg.retime.done_from_lp', sid=updated.short_id, iso=updated.timestamp.isoformat())}[/green]"
+            f"[green]{t('msg.retime.done_from_lp', sid=updated.short_id, iso=_fmt_ts(updated.timestamp))}[/green]"
         )
         return
     raw = prompt_path(
         console, t("prompt.new_ts"),
-        default=Path(snap.timestamp.isoformat()),
+        default=Path(_fmt_ts(snap.timestamp)),
     )
     try:
         new_ts = datetime.fromisoformat(str(raw))
@@ -881,7 +883,7 @@ def run_retime_flow(console: Console, env: EnvironmentSummary):
         new_ts = new_ts.replace(tzinfo=timezone.utc)
     updated = repo.retime_snapshot(snap, new_ts)
     console.print(
-        f"[green]{t('msg.retime.done_explicit', sid=updated.short_id, iso=updated.timestamp.isoformat())}[/green]"
+        f"[green]{t('msg.retime.done_explicit', sid=updated.short_id, iso=_fmt_ts(updated.timestamp))}[/green]"
     )
 
 
@@ -906,7 +908,7 @@ def run_thumbnail_flow(console: Console, env: EnvironmentSummary):
         return
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("render", total=None)
+        task = progress.add_task(t("task.render"), total=None)
         cb = _make_phase_cb(progress, task, prefix="phase")
         for snap in targets:
             manifest = read_manifest(snap.manifest_path)
@@ -958,7 +960,7 @@ def run_verify_roundtrip_flow(console: Console, env: EnvironmentSummary):
     from ..store.roundtrip import verify_roundtrip
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("verify", total=None)
+        task = progress.add_task(t("task.verify"), total=None)
         cb = _make_phase_cb(progress, task, prefix="phase")
         report = verify_roundtrip(repo, snap, source, progress_cb=cb)
     color = "green" if report.passed else "red"
@@ -984,7 +986,7 @@ def run_verify_folders_flow(console: Console, env: EnvironmentSummary):
     from ..store.roundtrip import compare_directories
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("compare", total=None)
+        task = progress.add_task(t("task.compare"), total=None)
         cb = _make_phase_cb(progress, task, prefix="phase")
         report = compare_directories(a, b, progress_cb=cb)
     color = "green" if report.passed else "red"
@@ -1020,7 +1022,7 @@ def run_logs_flow(console: Console, env: EnvironmentSummary):
             return
         for s in snaps:
             console.print(
-                f"{s.short_id}  {s.timestamp.isoformat()}  "
+                f"{s.short_id}  {_fmt_ts(s.timestamp)}  "
                 f"{(s.label or '-'):26}  "
                 f"servers={s.server_count} files={s.file_count}"
             )
@@ -1154,7 +1156,7 @@ def run_migrate_mca_flow(console: Console, env: EnvironmentSummary):
 
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("migrate", total=None)
+        task = progress.add_task(t("task.migrate"), total=None)
         cb = _make_phase_cb(progress, task, prefix="migrate")
         dry = repo.migrate_mca_files_to_chunks(dry_run=True, progress_cb=cb)
     console.print(f"[bold]{dry.summary()}[/bold]")
@@ -1169,7 +1171,7 @@ def run_migrate_mca_flow(console: Console, env: EnvironmentSummary):
 
     progress = make_progress(console)
     with progress:
-        task = progress.add_task("migrate", total=None)
+        task = progress.add_task(t("task.migrate"), total=None)
         cb = _make_phase_cb(progress, task, prefix="migrate")
         result = repo.migrate_mca_files_to_chunks(dry_run=False, progress_cb=cb)
     console.print(f"[green]{result.summary()}[/green]")
@@ -1183,23 +1185,23 @@ def run_repos_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
         console, t("menu.repos"),
         t("menu.repos.hint"),
-        expects="A vault path (when adding).",
+        expects=t("registry.expects_repo"),
     )
     repos = _cfg.list_repos()
     if repos:
         console.print(f"\n[bold]{t('menu.repos')}:[/bold]")
         for r in repos:
             label = f"  [{r.label}]" if r.label else ""
-            marker = "" if r.path.is_dir() else "  [dim](missing)[/dim]"
+            marker = "" if r.path.is_dir() else f"  [dim]({t('registry.missing')})[/dim]"
             console.print(f"  {r.path}{label}{marker}")
     else:
-        console.print(f"[dim](none registered yet)[/dim]")
+        console.print(f"[dim]{t('registry.none_registered')}[/dim]")
     actions = [
-        f"add  │ {t('menu.repos.hint')}",
-        f"remove │ unregister an existing entry",
+        f"{t('registry.action.add')}  │ {t('menu.repos.hint')}",
+        f"{t('registry.action.remove')} │ {t('registry.action.remove.hint')}",
         t("prompt.logs.action.back"),
     ]
-    pick = choose_one(console, t("prompt.logs.action"), actions)
+    pick = choose_one(console, t("registry.action.prompt"), actions)
     if pick == actions[2]:
         return
     if pick == actions[0]:
@@ -1208,20 +1210,20 @@ def run_repos_flow(console: Console, env: EnvironmentSummary):
         label = console.input(t("prompt.label_blank")).strip()
         added = _cfg.add_repo(path, label=label)
         if added:
-            console.print(f"[green]registered:[/green] {Path(path).resolve()}")
+            console.print(f"[green]{t('registry.registered')}[/green] {Path(path).resolve()}")
         else:
-            console.print(f"[dim]already registered[/dim]")
+            console.print(f"[dim]{t('registry.already_registered')}[/dim]")
         return
     if pick == actions[1]:
         if not repos:
-            console.print(f"[dim](nothing to remove)[/dim]")
+            console.print(f"[dim]{t('registry.nothing_to_remove')}[/dim]")
             return
         options = [str(r.path) for r in repos]
-        target = choose_one(console, "Which to remove?", options)
+        target = choose_one(console, t("registry.which_to_remove"), options)
         if target is None:
             return
         if _cfg.remove_repo(target):
-            console.print(f"[green]removed:[/green] {target}")
+            console.print(f"[green]{t('registry.removed')}[/green] {target}")
 
 
 def run_sources_flow(console: Console, env: EnvironmentSummary):
@@ -1230,23 +1232,23 @@ def run_sources_flow(console: Console, env: EnvironmentSummary):
     render_op_intro(
         console, t("menu.sources"),
         t("menu.sources.hint"),
-        expects="A directory path containing backup archives (when adding).",
+        expects=t("registry.expects_source"),
     )
     sources = _cfg.list_source_paths()
     if sources:
         console.print(f"\n[bold]{t('menu.sources')}:[/bold]")
         for s in sources:
             label = f"  [{s.label}]" if s.label else ""
-            marker = "" if s.path.is_dir() else "  [dim](missing)[/dim]"
+            marker = "" if s.path.is_dir() else f"  [dim]({t('registry.missing')})[/dim]"
             console.print(f"  {s.path}{label}{marker}")
     else:
-        console.print(f"[dim](none registered yet)[/dim]")
+        console.print(f"[dim]{t('registry.none_registered')}[/dim]")
     actions = [
-        f"add  │ {t('menu.sources.hint')}",
-        f"remove │ unregister an existing entry",
+        f"{t('registry.action.add')}  │ {t('menu.sources.hint')}",
+        f"{t('registry.action.remove')} │ {t('registry.action.remove.hint')}",
         t("prompt.logs.action.back"),
     ]
-    pick = choose_one(console, t("prompt.logs.action"), actions)
+    pick = choose_one(console, t("registry.action.prompt"), actions)
     if pick == actions[2]:
         return
     if pick == actions[0]:
@@ -1255,18 +1257,18 @@ def run_sources_flow(console: Console, env: EnvironmentSummary):
         label = console.input(t("prompt.label_blank")).strip()
         added = _cfg.add_source_path(path, label=label)
         if added:
-            console.print(f"[green]registered:[/green] {Path(path).resolve()}")
+            console.print(f"[green]{t('registry.registered')}[/green] {Path(path).resolve()}")
         else:
-            console.print(f"[dim]already registered[/dim]")
+            console.print(f"[dim]{t('registry.already_registered')}[/dim]")
         return
     if pick == actions[1]:
         if not sources:
-            console.print(f"[dim](nothing to remove)[/dim]")
+            console.print(f"[dim]{t('registry.nothing_to_remove')}[/dim]")
             return
         options = [str(s.path) for s in sources]
-        target = choose_one(console, "Which to remove?", options)
+        target = choose_one(console, t("registry.which_to_remove"), options)
         if target is None:
             return
         if _cfg.remove_source_path(target):
-            console.print(f"[green]removed:[/green] {target}")
+            console.print(f"[green]{t('registry.removed')}[/green] {target}")
 

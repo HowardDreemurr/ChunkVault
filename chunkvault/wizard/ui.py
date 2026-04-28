@@ -22,6 +22,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
 
+from .._timefmt import format_local as _fmt_ts
 from .i18n import t
 from rich.progress import (
     BarColumn,
@@ -64,12 +65,12 @@ def fmt_bytes(n: int) -> str:
 def render_environment(console: Console, env: EnvironmentSummary) -> None:
     """Print a digestible summary of what we found on the local system."""
     if env.repos:
-        table = Table(title="Detected chunkvault repos", title_style="bold")
-        table.add_column("path", style="cyan")
-        table.add_column("kind", style="yellow")
-        table.add_column("snapshots", justify="right")
-        table.add_column("log snaps", justify="right")
-        table.add_column("on-disk", justify="right")
+        table = Table(title=t("env.repos.title"), title_style="bold")
+        table.add_column(t("env.repos.col.path"), style="cyan")
+        table.add_column(t("env.repos.col.kind"), style="yellow")
+        table.add_column(t("env.repos.col.snapshots"), justify="right")
+        table.add_column(t("env.repos.col.log_snaps"), justify="right")
+        table.add_column(t("env.repos.col.metadata"), justify="right")
         for r in env.repos:
             table.add_row(
                 str(r.path), r.kind,
@@ -77,23 +78,24 @@ def render_environment(console: Console, env: EnvironmentSummary) -> None:
                 fmt_bytes(r.on_disk_bytes),
             )
         console.print(table)
+        console.print(f"[dim]{t('env.repos.metadata_hint')}[/dim]")
     else:
         console.print(Panel(
-            "No existing repo found near cwd.\n"
-            "[dim](First-time setup will create one.)[/dim]",
-            title="Repos", border_style="dim",
+            t("env.repos.empty.body"),
+            title=t("env.repos.empty.title"), border_style="dim",
         ))
 
     if env.source_paths:
-        table = Table(title="Source archive locations", title_style="bold")
-        table.add_column("path", style="cyan")
-        table.add_column("archives", justify="right")
-        table.add_column("total bytes", justify="right")
-        table.add_column("samples", style="dim")
+        table = Table(title=t("env.sources.title"), title_style="bold")
+        table.add_column(t("env.sources.col.path"), style="cyan")
+        table.add_column(t("env.sources.col.archives"), justify="right")
+        table.add_column(t("env.sources.col.total_bytes"), justify="right")
+        table.add_column(t("env.sources.col.samples"), style="dim")
         for s in env.source_paths:
             samples = ", ".join(s.samples[:3])
             if len(s.samples) < s.archive_count:
-                samples += f", … (+{s.archive_count - len(s.samples)} more)"
+                samples += t("env.sources.more_samples",
+                             n=s.archive_count - len(s.samples))
             table.add_row(
                 str(s.path), str(s.archive_count),
                 fmt_bytes(s.total_bytes), samples,
@@ -101,9 +103,8 @@ def render_environment(console: Console, env: EnvironmentSummary) -> None:
         console.print(table)
     else:
         console.print(Panel(
-            "No backup archives detected on the default scan paths.\n"
-            "[dim](You can point one in manually.)[/dim]",
-            title="Sources", border_style="dim",
+            t("env.sources.empty.body"),
+            title=t("env.sources.empty.title"), border_style="dim",
         ))
 
 
@@ -128,33 +129,35 @@ def render_archive_preview(
 
     header = f"[bold cyan]{preview.path.name}[/bold cyan]"
     if preview.timestamp:
-        header += f"  [dim](timestamp: {preview.timestamp.isoformat()})[/dim]"
+        header += f"  [dim](timestamp: {_fmt_ts(preview.timestamp)})[/dim]"
     console.print(header)
 
     if preview.error:
-        console.print(f"  [red]error:[/red] {preview.error}")
+        console.print(f"  [red]{t('preview.error_label')}[/red] {preview.error}")
         return
 
     if not preview.servers:
-        console.print("  [yellow]no server folders detected[/yellow]")
+        console.print(f"  [yellow]{t('preview.no_servers')}[/yellow]")
         # Diagnostic — only when we DIDN'T find anything: show what was
         # there so the user can tell if they pointed at the wrong path.
         if preview.other_top_level:
+            entries = (
+                ", ".join(preview.other_top_level[:6])
+                + ("…" if len(preview.other_top_level) > 6 else "")
+            )
             console.print(
-                f"  [dim]top-level entries: "
-                f"{', '.join(preview.other_top_level[:6])}"
-                f"{'…' if len(preview.other_top_level) > 6 else ''}[/dim]"
+                f"  [dim]{t('preview.top_level', entries=entries)}[/dim]"
             )
         return
 
     table = Table(box=None, padding=(0, 2), show_edge=False, pad_edge=False)
-    table.add_column("server", style="cyan")
-    table.add_column("regions", justify="right")
-    table.add_column("dimensions", style="dim")
-    table.add_column("logs", justify="right")
-    table.add_column("crashes", justify="right")
-    table.add_column("level.dat")
-    table.add_column("world size", justify="right")
+    table.add_column(t("preview.col.server"), style="cyan")
+    table.add_column(t("preview.col.regions"), justify="right")
+    table.add_column(t("preview.col.dimensions"), style="dim")
+    table.add_column(t("preview.col.logs"), justify="right")
+    table.add_column(t("preview.col.crashes"), justify="right")
+    table.add_column(t("preview.col.level_dat"))
+    table.add_column(t("preview.col.world_size"), justify="right")
 
     any_zero_region = False
     for s in preview.servers:
@@ -169,7 +172,8 @@ def render_archive_preview(
             dims,
             str(s.log_files),
             str(s.crash_report_files),
-            "[green]yes[/green]" if s.has_level_dat else "[red]no[/red]",
+            (f"[green]{t('preview.yes')}[/green]" if s.has_level_dat
+             else f"[red]{t('preview.no')}[/red]"),
             fmt_bytes(s.estimated_world_bytes),
         )
     console.print(table)
@@ -180,10 +184,12 @@ def render_archive_preview(
     if any_zero_region:
         for s in preview.servers:
             if s.region_files == 0 and s.top_level:
+                entries = (
+                    ", ".join(s.top_level[:8])
+                    + ("…" if len(s.top_level) > 8 else "")
+                )
                 console.print(
-                    f"  [dim]{s.name} contains: "
-                    f"{', '.join(s.top_level[:8])}"
-                    f"{'…' if len(s.top_level) > 8 else ''}[/dim]"
+                    f"  [dim]{t('preview.contains', server=s.name, entries=entries)}[/dim]"
                 )
     console.print()
 
@@ -200,7 +206,7 @@ def _render_archive_preview_compact(
     if not preview.servers:
         console.print(
             f"  [yellow]?[/yellow] {preview.path.name}: "
-            f"[dim]no servers detected[/dim]"
+            f"[dim]{t('preview.compact.no_servers')}[/dim]"
         )
         return
     bits: list[str] = []
@@ -229,9 +235,9 @@ def select_archives(
     for archive, preview in zip(archives, previews):
         # Build a single-line label that fits in a terminal
         if preview.error:
-            tag = f"[error: {preview.error[:30]}]"
+            tag = t("select_archives.tag.error", err=preview.error[:30])
         elif not preview.servers:
-            tag = "[no servers]"
+            tag = t("select_archives.tag.no_servers")
         else:
             servers_summary = ", ".join(
                 f"{s.name}({s.region_files}r)" for s in preview.servers
@@ -242,12 +248,10 @@ def select_archives(
         label = f"{archive.name}  │ {tag}"
         choices.append(questionary.Choice(label, value=archive, checked=False))
     answer = questionary.checkbox(
-        "Select archives to ingest:",
+        t("select_archives.title"),
         choices=choices,
         style=_QSTYLE,
-        instruction=(
-            "(↑↓ move • Space toggle • a select-all • i invert • Enter accept)"
-        ),
+        instruction=t("select_archives.instruction"),
     ).ask()
     return list(answer) if answer is not None else []
 

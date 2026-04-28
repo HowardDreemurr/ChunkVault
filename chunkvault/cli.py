@@ -20,10 +20,18 @@ from pathlib import Path
 from typing import Sequence
 
 from .diff import diff_worlds
+from ._timefmt import format_local, format_utc
 
 
 def _fmt_counts(counts: dict[str, int]) -> str:
     return f"+{counts['added']} ~{counts['modified']} -{counts['removed']}"
+
+
+def _fmt_ts(dt, args: argparse.Namespace | None = None) -> str:
+    """Pick UTC vs local based on a `--utc` flag (if present), default local."""
+    if args is not None and getattr(args, "utc", False):
+        return format_utc(dt)
+    return format_local(dt)
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
@@ -187,7 +195,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     label = args.label or session.default_label
     with session as world_dir:
         snap = repo.snapshot(world_dir, label=label, allow_live=True)
-    print(f"{snap.short_id}  {snap.timestamp.isoformat()}  {label}  "
+    print(f"{snap.short_id}  {_fmt_ts(snap.timestamp, args)}  {label}  "
           f"(imported from {args.archive.name if hasattr(args.archive, 'name') else args.archive})")
     return 0
 
@@ -323,7 +331,7 @@ def cmd_logs_list(args: argparse.Namespace) -> int:
         print("(no log snapshots)")
         return 0
     for s in snaps:
-        print(f"{s.short_id}  {s.timestamp.isoformat()}  "
+        print(f"{s.short_id}  {_fmt_ts(s.timestamp, args)}  "
               f"{(s.label or '-'):26}  servers={s.server_count} files={s.file_count}")
     return 0
 
@@ -409,7 +417,7 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     extra = ""
     if hasattr(snap, "mc_version") and snap.mc_version:
         extra = f"  mc={snap.mc_version}"
-    print(f"{snap.short_id}  {snap.timestamp.isoformat()}  {label}{extra}")
+    print(f"{snap.short_id}  {_fmt_ts(snap.timestamp, args)}  {label}{extra}")
     return 0
 
 
@@ -655,13 +663,13 @@ def cmd_retime(args: argparse.Namespace) -> int:
                 continue
             if args.dry_run:
                 print(f"would retime {snap.short_id} ({snap.label or '-'})  "
-                      f"{snap.timestamp.isoformat()} → {new_ts.isoformat()}  "
+                      f"{_fmt_ts(snap.timestamp, args)} → {_fmt_ts(new_ts, args)}  "
                       f"[{source}]")
                 changed += 1
                 continue
             repo.retime_snapshot(snap, new_ts)
             print(f"retimed {snap.short_id} ({snap.label or '-'})  "
-                  f"→ {new_ts.isoformat()}  [{source}]")
+                  f"→ {_fmt_ts(new_ts, args)}  [{source}]")
             changed += 1
         except ChunkRepoError as e:
             skipped.append((snap.short_id, str(e)))
@@ -710,9 +718,9 @@ def cmd_repair_timestamps(args: argparse.Namespace) -> int:
     if report.duplicate_groups:
         print(f"\n# {len(report.duplicate_groups)} duplicate group(s):")
         for g in report.duplicate_groups[:20]:
-            ts = datetime.fromtimestamp(
+            ts = _fmt_ts(datetime.fromtimestamp(
                 g.target_ts_ms / 1000, tz=timezone.utc,
-            ).isoformat()
+            ), args)
             print(f"  {g.world_name} @ {ts}")
             print(f"    keep:   {g.winner_id[:12]}")
             for lid in g.loser_ids:
@@ -724,12 +732,12 @@ def cmd_repair_timestamps(args: argparse.Namespace) -> int:
         print(f"\n# {verb} {len(report.to_retime)} snapshot(s) "
               f"(showing first 20):")
         for plan in report.to_retime[:20]:
-            old_iso = datetime.fromtimestamp(
+            old_iso = _fmt_ts(datetime.fromtimestamp(
                 plan.old_ts_ms / 1000, tz=timezone.utc,
-            ).isoformat()
-            new_iso = datetime.fromtimestamp(
+            ), args)
+            new_iso = _fmt_ts(datetime.fromtimestamp(
                 plan.new_ts_ms / 1000, tz=timezone.utc,
-            ).isoformat()
+            ), args)
             label_part = (
                 f"  label: {plan.old_label!r} → {plan.new_label!r}"
                 if plan.new_label != plan.old_label else ""
@@ -782,7 +790,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             tail = f"mc={snap.mc_version} world={snap.world_name}"
         else:
             tail = getattr(snap, "subject", snap.world_name or "")
-        print(f"{snap.short_id}  {snap.timestamp.isoformat()}  {label:20}  {tail}")
+        print(f"{snap.short_id}  {_fmt_ts(snap.timestamp, args)}  {label:20}  {tail}")
     return 0
 
 
@@ -791,7 +799,10 @@ def cmd_restore(args: argparse.Namespace) -> int:
     snap = repo.get(args.snapshot)
     if snap is None:
         raise RuntimeError(f"no such snapshot: {args.snapshot!r}")
-    repo.restore(snap, args.dest, paths=args.path or None)
+    kwargs: dict = {"paths": args.path or None}
+    if getattr(args, "parallelism", None) is not None:
+        kwargs["parallelism"] = args.parallelism
+    repo.restore(snap, args.dest, **kwargs)
     print(f"restored {snap.short_id} → {args.dest}"
           + (f" (paths: {args.path})" if args.path else ""))
     return 0
@@ -873,6 +884,9 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list", help="List snapshots, newest first.")
     _add_store_arg(ls)
     ls.add_argument("repo", type=Path)
+    ls.add_argument("--utc", action="store_true",
+                    help="Display timestamps in UTC instead of host-local "
+                         "timezone (useful for scripts that parse output).")
     ls.set_defaults(func=cmd_list)
 
     re = sub.add_parser("restore", help="Restore a snapshot (optionally a subset).")
@@ -882,6 +896,9 @@ def build_parser() -> argparse.ArgumentParser:
     re.add_argument("dest", type=Path)
     re.add_argument("--path", action="append",
                     help="Restrict restore to a path (repeatable).")
+    re.add_argument("--parallelism", type=int, default=None, metavar="N",
+                    help="Restore worker thread count. Default: auto "
+                         "(min(cpu_count, 8)). Pass 1 for serial. (chunk store only.)")
     re.set_defaults(func=cmd_restore)
 
     dl = sub.add_parser("delete", help="Delete a snapshot.")
@@ -1103,6 +1120,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ll = sub.add_parser("logs-list", help="List log snapshots.")
     ll.add_argument("repo", type=Path)
+    ll.add_argument("--utc", action="store_true",
+                    help="Display timestamps in UTC.")
     ll.set_defaults(func=cmd_logs_list)
 
     le = sub.add_parser("logs-extract",
