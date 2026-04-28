@@ -129,6 +129,96 @@ def test_second_snapshot_skips_cached_tiles(tmp_path: Path):
     assert stats.tiles_skipped_cached >= 1
 
 
+def test_render_persists_chunk_renders_incrementally(
+    tmp_path: Path, monkeypatch,
+):
+    """Chaos: render N chunks, simulate Ctrl+C mid-loop after the
+    incremental commit fired, then verify already-committed entries
+    survived.
+
+    With the old design (commit only at end-of-group) all entries in
+    the killed group would be lost. The new design commits every
+    _RENDER_COMMIT_BATCH chunks; we set BATCH=1 here so the crash
+    after chunk #2 leaves chunks #1 + #2 committed but ALL chunks
+    #3+ uncommitted — and the next run only re-renders #3+.
+    """
+    from chunkvault.store.manifest import read_manifest
+    from chunkvault.store.index import IndexDB
+    from chunkvault.viz import snapshot_render as sr
+
+    # 3 chunks with DIFFERENT valid payloads so we get 3 unique hashes
+    # that all actually render (not get rejected by the parser). Need
+    # at least 3 to see the trap fire AFTER 2 successful commits.
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = tmp_path / "world"
+    world.mkdir()
+    (world / "level.dat").write_bytes(
+        _make_level_dat("1.20.4", 3700, last_played_ms=1_000_000),
+    )
+    grass = _grass_chunk_payload()
+    dirt = zlib.compress(_build_chunk_1_18([
+        _build_section_uniform(0, "minecraft:dirt"),
+    ]))
+    stone = zlib.compress(_build_chunk_1_18([
+        _build_section_uniform(0, "minecraft:stone"),
+    ]))
+    write_region_file(world, "region", 0, 0, [
+        ChunkSpec(0, 0, 1, 2, grass),
+        ChunkSpec(1, 0, 1, 2, dirt),
+        ChunkSpec(2, 0, 1, 2, stone),
+    ])
+    snap = repo.snapshot(world, label="x", verify_roundtrip=False)
+    manifest = read_manifest(snap.manifest_path)
+
+    # After snapshot, ensure_tiles_for_manifest already ran. Wipe so
+    # we can re-run under the chaos harness.
+    with IndexDB(repo.index_path) as idx:
+        idx._conn.execute("DELETE FROM chunk_renders")
+        idx._conn.commit()
+
+    # Tiny commit batch to make incremental persistence visible
+    monkeypatch.setattr(sr, "_RENDER_COMMIT_BATCH", 1)
+
+    # Trap IndexDB.add_chunk_renders: let the first call write, then raise
+    # on the 2nd. This simulates a crash that strikes AFTER 2 commits
+    # already landed (real_add runs before the raise, so the 2nd batch
+    # is also persisted before the exception bubbles).
+    real_add = IndexDB.add_chunk_renders
+    calls = {"n": 0}
+
+    def trap_add(self, items):
+        calls["n"] += 1
+        real_add(self, items)
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated Ctrl+C")
+
+    monkeypatch.setattr(IndexDB, "add_chunk_renders", trap_add)
+
+    # ensure_tiles_for_manifest doesn't catch RuntimeError around the
+    # commit call (only around the per-chunk render block), so the
+    # exception escapes.
+    with pytest.raises(RuntimeError, match="simulated"):
+        ensure_tiles_for_manifest(repo, manifest)
+
+    # 2 entries committed before the crash (real_add ran in both calls,
+    # the second one just raised AFTER writing).
+    with IndexDB(repo.index_path) as idx:
+        cur = idx._conn.execute("SELECT COUNT(*) FROM chunk_renders")
+        committed_after_crash = cur.fetchone()[0]
+    assert committed_after_crash == 2, (
+        f"expected 2 entries committed before the crash, "
+        f"got {committed_after_crash}"
+    )
+
+    # Restore add_chunk_renders + reset batch size, re-run.
+    monkeypatch.undo()
+    stats = ensure_tiles_for_manifest(repo, manifest)
+    # The 2 already-committed chunks are cache hits; the remaining
+    # uncommitted ones get rendered fresh.
+    assert stats.tiles_skipped_cached == 2
+
+
 def test_render_progress_emits_during_inner_loop(tmp_path: Path):
     """Progress events must come out *while* a group is rendering, not just
     at end-of-group. With ~1M chunks per group on real worlds, the per-group

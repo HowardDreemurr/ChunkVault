@@ -38,6 +38,26 @@ NETHER_DIM_KEYS = ("DIM-1/region", "DIM-1")
 END_DIM_KEYS = ("DIM1/region", "DIM1")
 
 
+# Tunable, used by ensure_tiles_for_manifest. Module-level so tests can
+# monkeypatch them; production callers shouldn't need to touch them.
+#
+# _RENDER_PROGRESS_TICK: emit a phase_progress event every N chunks
+#   inside the inner render loop. Without this the rich progress bar
+#   sits at 0/N for hours on a multi-million-chunk first-pass render.
+#   256 keeps the console responsive without flooding it.
+#
+# _RENDER_COMMIT_BATCH: persist chunk_renders presence rows every N
+#   successful renders. The previous design batched only at end-of-
+#   group, so a Ctrl+C at 99% of a 4M-chunk group lost ALL the index
+#   entries — the .png files were on disk, but nothing in the index
+#   knew that, and the next run re-rendered every one of them. The
+#   batch size bounds the blast radius of an interrupt to ~N
+#   redundantly-rendered tiles while keeping SQLite write
+#   amplification reasonable.
+_RENDER_PROGRESS_TICK = 256
+_RENDER_COMMIT_BATCH = 1024
+
+
 def modes_for_dim(dim_key: str) -> tuple[str, ...]:
     """Which render modes apply to a given dimension's region key."""
     # Nether's bedrock ceiling makes a single "top-down" view useless;
@@ -95,11 +115,9 @@ def ensure_tiles_for_manifest(
         total=total_to_check,
     ))
 
-    # Emit a progress update every N chunks while rendering, not just once
-    # per group. With ~1M chunks per group, the per-group cadence makes the
-    # bar look frozen for hours on the first cold pass even though work is
-    # progressing. 256 keeps the rich console responsive without flooding it.
-    _PROGRESS_TICK = 256
+    # See module-level constants for tuning rationale.
+    progress_tick = _RENDER_PROGRESS_TICK
+    commit_batch = _RENDER_COMMIT_BATCH
 
     seen = 0
     with __import__("chunkvault.store.index", fromlist=["IndexDB"]).IndexDB(
@@ -120,8 +138,11 @@ def ensure_tiles_for_manifest(
                     label=f"{dim_key}/{mode} (cached)",
                     current=seen, total=total_to_check,
                 ))
+            # Buffer for incremental chunk_renders commits.
+            uncommitted: list[bytes] = []
             for i, h in enumerate(missing, 1):
                 blob = repo.chunks.read_chunk(h)
+                rendered_ok = False
                 if blob is None or len(blob) < 1:
                     stats.chunks_failed += 1
                 else:
@@ -132,22 +153,31 @@ def ensure_tiles_for_manifest(
                         tile = render_chunk_nbt(nbt, mode)
                         repo.tiles.store(h, mode, tile)
                         stats.tiles_rendered += 1
+                        rendered_ok = True
                     except (RenderError, Exception):
                         stats.chunks_failed += 1
+                if rendered_ok:
+                    uncommitted.append(h)
+                    if len(uncommitted) >= commit_batch:
+                        # Persist in batches so a Ctrl+C only loses up to
+                        # commit_batch entries, not the entire group.
+                        index.add_chunk_renders(
+                            [(uh, mode) for uh in uncommitted],
+                        )
+                        uncommitted.clear()
                 seen += 1
                 # Emit during the inner loop so a multi-million-chunk group
                 # doesn't appear frozen. Branch is cheap; _emit only runs
                 # once per tick.
-                if i % _PROGRESS_TICK == 0:
+                if i % progress_tick == 0:
                     _emit(progress_cb, ProgressEvent(
                         kind="phase_progress", phase="render_tiles",
                         label=f"{dim_key}/{mode}",
                         current=seen, total=total_to_check,
                     ))
-            # Mark the entire group present in the index in one batch
-            new_items = [(h, mode) for h in missing]
-            if new_items:
-                index.add_chunk_renders(new_items)
+            # Final flush for the group's tail.
+            if uncommitted:
+                index.add_chunk_renders([(uh, mode) for uh in uncommitted])
             _emit(progress_cb, ProgressEvent(
                 kind="phase_progress", phase="render_tiles",
                 label=f"{dim_key}/{mode}",
