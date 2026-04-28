@@ -620,7 +620,10 @@ def cmd_repair_timestamps(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
     from .store import ChunkSnapshotRepo
     repo = ChunkSnapshotRepo(args.repo)
-    report = repo.repair_timestamps(dry_run=not args.apply)
+    report = repo.repair_timestamps(
+        dry_run=not args.apply,
+        fsck_first=not getattr(args, "no_fsck", False),
+    )
     print(report.summary())
     if report.no_last_played:
         print(f"\n# {len(report.no_last_played)} snapshot(s) have no "
@@ -686,7 +689,10 @@ def cmd_migrate_mca_files(args: argparse.Namespace) -> int:
     """
     from .store import ChunkSnapshotRepo
     repo = ChunkSnapshotRepo(args.repo)
-    report = repo.migrate_mca_files_to_chunks(dry_run=not args.apply)
+    report = repo.migrate_mca_files_to_chunks(
+        dry_run=not args.apply,
+        fsck_first=not getattr(args, "no_fsck", False),
+    )
     print(report.summary())
     if report.errors:
         print(f"\n# {len(report.errors)} error(s):", file=sys.stderr)
@@ -946,6 +952,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Actually delete duplicates and retime survivors. Without "
              "this flag, only a report is printed (DRY RUN).",
     )
+    rp.add_argument(
+        "--no-fsck", action="store_true",
+        help="Skip the automatic fsck-first pass. fsck is normally run "
+             "with repair=True before scanning, to clean up any leftover "
+             "half-applied state from prior interrupted writes. Skip only "
+             "if you've already fsck'd or are debugging.",
+    )
     rp.set_defaults(func=cmd_repair_timestamps)
 
     mm = sub.add_parser(
@@ -959,6 +972,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply", action="store_true",
         help="Actually rewrite manifests + adjust ref counts. Without "
              "this flag, only a report is printed (DRY RUN).",
+    )
+    mm.add_argument(
+        "--no-fsck", action="store_true",
+        help="Skip the automatic fsck-first pass. See repair-timestamps "
+             "--no-fsck for context.",
     )
     mm.set_defaults(func=cmd_migrate_mca_files)
 

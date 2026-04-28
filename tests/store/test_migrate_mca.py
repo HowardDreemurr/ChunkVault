@@ -161,6 +161,34 @@ def test_migration_is_idempotent(tmp_path: Path):
     assert r2.files_migrated == 0
 
 
+def test_fsck_repairs_index_underrefs_from_manifest(tmp_path: Path):
+    """Chaos: simulate a Ctrl+C during migrate-mca between manifest write
+    (atomic, succeeded — manifest now references new chunks) and the SQL
+    ref-count bump. Result: chunks on disk + manifest references them, but
+    index has no presence rows / ref_count too low. fsck(repair=True)
+    should detect this manifest-vs-index desync and reconcile."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    world = _seed_world_with_entities(tmp_path)
+    snap = repo.snapshot(world, label="post-crash", verify_roundtrip=False)
+    m = read_manifest(snap.manifest_path)
+
+    # Pick one chunk hash from the manifest and yank its index row.
+    target_hash = next(iter(m.dimensions["region"]))[0].chunks[0].content_hash if False else m.dimensions["region"][0].chunks[0].content_hash
+    with IndexDB(repo.index_path) as idx:
+        idx._conn.execute("DELETE FROM chunks WHERE content_hash = ?", (target_hash,))
+        idx._conn.commit()
+
+    # fsck should see 1 manifest-unreferenced chunk and repair it
+    report = repo.fsck(repair=True)
+    assert report.manifest_unreferenced_chunks == 1
+    assert report.repaired == 1
+
+    # Re-running fsck should now show clean
+    report2 = repo.fsck(repair=False)
+    assert report2.manifest_unreferenced_chunks == 0
+
+
 def test_migration_handles_missing_pool_blob_gracefully(tmp_path: Path):
     """If a file blob is missing from the pool, error is reported but
     other files still migrate."""

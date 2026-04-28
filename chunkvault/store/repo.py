@@ -291,12 +291,22 @@ class FsckReport:
     orphan_log_manifests: list[str] = field(default_factory=list)
     dangling_log_rows: list[str] = field(default_factory=list)
     stray_temp_files: list[str] = field(default_factory=list)
+    # Manifest-vs-index ref-count desync. Manifests reference these
+    # chunks/files but the index has fewer (or no) ref counts for them
+    # — typical aftermath of a Ctrl+C during migrate-mca-files between
+    # the manifest write and the SQL ref bumps. fsck(repair=True)
+    # catches this up by reading manifests and adding the missing refs.
+    manifest_unreferenced_chunks: int = 0
+    manifest_unreferenced_files: int = 0
+    repaired: int = 0
 
     @property
     def total_issues(self) -> int:
         return (len(self.orphan_manifests) + len(self.dangling_rows)
                 + len(self.orphan_log_manifests) + len(self.dangling_log_rows)
-                + len(self.stray_temp_files))
+                + len(self.stray_temp_files)
+                + self.manifest_unreferenced_chunks
+                + self.manifest_unreferenced_files)
 
     @property
     def clean(self) -> bool:
@@ -311,7 +321,9 @@ class FsckReport:
             f"dangling-rows={len(self.dangling_rows)}, "
             f"orphan-log-manifests={len(self.orphan_log_manifests)}, "
             f"dangling-log-rows={len(self.dangling_log_rows)}, "
-            f"stray-temp-files={len(self.stray_temp_files)}"
+            f"stray-temp-files={len(self.stray_temp_files)}, "
+            f"manifest-unreferenced-chunks={self.manifest_unreferenced_chunks}, "
+            f"manifest-unreferenced-files={self.manifest_unreferenced_files}"
         )
 
 
@@ -1529,6 +1541,81 @@ class ChunkSnapshotRepo:
                     except OSError:
                         pass
 
+            # 4) Manifest-vs-index reconciliation: every chunk/file that an
+            # indexed manifest references must have a presence row + adequate
+            # ref_count. Missing rows mean a previous write (snapshot,
+            # migrate-mca, etc.) was Ctrl+C'd between manifest write and
+            # SQL update — the manifest is the durable truth, so we add
+            # what's missing here. This catches the migrate-mca chaos
+            # window where chunks landed in the pool + manifest but never
+            # got registered in the index.
+            expected_chunk_refs: dict[bytes, int] = {}
+            expected_file_refs: dict[bytes, int] = {}
+            for snap_id, row in indexed_manifests.items():
+                if snap_id not in on_disk_manifests:
+                    continue   # already handled above as dangling row
+                try:
+                    m = read_manifest(on_disk_manifests[snap_id])
+                except Exception:
+                    continue
+                for regions in m.dimensions.values():
+                    for region in regions:
+                        for c in region.chunks:
+                            expected_chunk_refs[c.content_hash] = (
+                                expected_chunk_refs.get(c.content_hash, 0) + 1
+                            )
+                for f in m.files:
+                    expected_file_refs[f.sha256] = (
+                        expected_file_refs.get(f.sha256, 0) + 1
+                    )
+
+            # Check each expected ref against the index. We only DETECT
+            # under-references here (manifest needs more than index has);
+            # over-references (index has refs but manifest doesn't) are
+            # leaks gc could catch later, less urgent.
+            cur = index._conn.execute("SELECT content_hash, ref_count FROM chunks")
+            actual_chunk_refs = {bytes(h): r for (h, r) in cur.fetchall()}
+            cur = index._conn.execute("SELECT content_hash, ref_count FROM files")
+            actual_file_refs = {bytes(h): r for (h, r) in cur.fetchall()}
+
+            chunk_underrefs: list[tuple[bytes, int]] = []   # (hash, missing_count)
+            for h, want in expected_chunk_refs.items():
+                have = actual_chunk_refs.get(h, 0)
+                if have < want:
+                    chunk_underrefs.append((h, want - have))
+            file_underrefs: list[tuple[bytes, int]] = []
+            for sha, want in expected_file_refs.items():
+                have = actual_file_refs.get(sha, 0)
+                if have < want:
+                    file_underrefs.append((sha, want - have))
+
+            report.manifest_unreferenced_chunks = len(chunk_underrefs)
+            report.manifest_unreferenced_files = len(file_underrefs)
+            if repair and (chunk_underrefs or file_underrefs):
+                try:
+                    index._conn.execute("BEGIN")
+                    for h, missing in chunk_underrefs:
+                        index._conn.execute(
+                            "INSERT INTO chunks (content_hash, ref_count) "
+                            "VALUES (?, ?) "
+                            "ON CONFLICT(content_hash) DO UPDATE "
+                            "SET ref_count = ref_count + ?",
+                            (h, missing, missing),
+                        )
+                    for sha, missing in file_underrefs:
+                        index._conn.execute(
+                            "INSERT INTO files (content_hash, ref_count) "
+                            "VALUES (?, ?) "
+                            "ON CONFLICT(content_hash) DO UPDATE "
+                            "SET ref_count = ref_count + ?",
+                            (sha, missing, missing),
+                        )
+                    index._conn.execute("COMMIT")
+                    report.repaired += len(chunk_underrefs) + len(file_underrefs)
+                except Exception:
+                    index._conn.execute("ROLLBACK")
+                    raise
+
         return report
 
     def _collect_refs_from_row(self, row, index) -> tuple[list[bytes], list[bytes]]:
@@ -1743,6 +1830,7 @@ class ChunkSnapshotRepo:
     def repair_timestamps(
         self, *,
         dry_run: bool = True,
+        fsck_first: bool = True,
         progress_cb: ProgressCallback = None,
     ) -> "RepairReport":
         """Walk every snapshot and align ``timestamp_ms`` with
@@ -1774,10 +1862,34 @@ class ChunkSnapshotRepo:
         is produced. ``dry_run=False`` applies the plan in dependency order
         (delete losers first so retimes don't collide).
         """
+        from ..wizard.i18n import t as _t
+
+        # Default-on safety net: fsck before scanning. Catches the half-
+        # applied states left behind by a Ctrl+C in a previous repair (or
+        # any other write op): orphan manifests, dangling rows, stray
+        # .tmp files, manifest-vs-index ref-count desync. We run fsck
+        # with repair=True even in dry-run mode for the OUTER call —
+        # fsck's repairs are themselves safe and idempotent, and a clean
+        # vault is a precondition for the dry-run report being accurate.
+        if fsck_first:
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_start", phase="repair_pre_fsck",
+                label=_t("phase.repair_scan.reading", count=0),  # placeholder, fsck has its own progress
+            ))
+            try:
+                self.fsck(repair=True)
+            except Exception as e:
+                _emit(progress_cb, ProgressEvent(
+                    kind="warning", phase="repair_pre_fsck",
+                    label=f"fsck failed (continuing): {e}",
+                ))
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_done", phase="repair_pre_fsck",
+            ))
+
         report = RepairReport()
         all_snaps = self.list()
         report.scanned = len(all_snaps)
-        from ..wizard.i18n import t as _t
 
         _emit(progress_cb, ProgressEvent(
             kind="phase_start", phase="repair_scan",
@@ -1982,6 +2094,7 @@ class ChunkSnapshotRepo:
     def migrate_mca_files_to_chunks(
         self, *,
         dry_run: bool = True,
+        fsck_first: bool = True,
         progress_cb: ProgressCallback = None,
     ) -> "MigrateMcaReport":
         """Retroactively chunk-dedupe MCA files that were stored as
@@ -2017,6 +2130,18 @@ class ChunkSnapshotRepo:
         from ..mca.region import Region, MCAError, EXTERNAL_FLAG
         from ..mca.hasher import hash_chunk
         from pathlib import PurePosixPath
+
+        # Default-on safety: fsck first, repair=True. Catches any pending
+        # half-applied state from prior interrupted writes so the migration
+        # plan is built against a consistent vault.
+        if fsck_first:
+            try:
+                self.fsck(repair=True)
+            except Exception as e:
+                _emit(progress_cb, ProgressEvent(
+                    kind="warning", phase="migrate_mca_pre_fsck",
+                    label=f"fsck failed (continuing): {e}",
+                ))
 
         report = MigrateMcaReport()
         all_snaps = self.list()
@@ -2159,37 +2284,72 @@ class ChunkSnapshotRepo:
                         current=applied,
                     ))
 
-                # Commit the manifest rewrite atomically: replace files with
-                # their dimension records, then index ref-count adjustments.
+                # Commit the manifest rewrite + all SQL updates as one
+                # atomic operation. Order matters: chunks were already
+                # written to the pool above (atomic, idempotent). Now write
+                # the manifest (also atomic), then a SINGLE SQL transaction
+                # bumps chunk refs + dec file refs + updates the snapshot
+                # row's counters. If killed:
+                #   - between manifest write and SQL: manifest is new, index
+                #     is stale, but chunks are on disk + referenced by the
+                #     manifest. fsck (with the manifest-aware reconciler)
+                #     detects the desync and adds missing chunk presence /
+                #     ref bumps from manifest contents. Safe.
+                #   - inside the SQL txn: rollback takes care of it.
                 try:
                     # Merge new dim records into the existing manifest.
                     for dim_key, recs in new_dims.items():
                         manifest.dimensions.setdefault(dim_key, []).extend(recs)
-                    # Drop migrated files from the files list.
                     removed_set = set(old_file_shas_to_remove)
                     manifest.files = [
                         f for f in manifest.files if f.sha256 not in removed_set
                     ]
                     write_manifest(snap.manifest_path, manifest)
-                    # Index updates: chunk presence + refs, file refs.
-                    if new_chunk_hashes:
-                        index.add_chunks(list({h for h in new_chunk_hashes}))
-                        index.adjust_chunk_refs(new_chunk_hashes, delta=+1)
-                    if old_file_shas_to_remove:
-                        index.adjust_file_refs(old_file_shas_to_remove, delta=-1)
-                    # Update snapshot row's chunk_count / file_count to match.
+
                     new_chunk_count = sum(
                         len(r.chunks)
                         for rs in manifest.dimensions.values()
                         for r in rs
                     )
                     new_file_count = len(manifest.files)
-                    index._conn.execute(
-                        "UPDATE snapshots SET chunk_count = ?, file_count = ? "
-                        "WHERE id = ?",
-                        (new_chunk_count, new_file_count, snap_id),
-                    )
-                    index._conn.commit()
+
+                    # Single SQL transaction: presence rows + chunk refs +
+                    # file refs + snapshot counters. All-or-nothing.
+                    index._conn.execute("BEGIN")
+                    try:
+                        if new_chunk_hashes:
+                            unique = list({h for h in new_chunk_hashes})
+                            index._conn.executemany(
+                                "INSERT OR IGNORE INTO chunks (content_hash) "
+                                "VALUES (?)",
+                                [(h,) for h in unique],
+                            )
+                            for h in new_chunk_hashes:
+                                index._conn.execute(
+                                    "INSERT INTO chunks (content_hash, ref_count) "
+                                    "VALUES (?, 1) "
+                                    "ON CONFLICT(content_hash) DO UPDATE "
+                                    "SET ref_count = ref_count + 1",
+                                    (h,),
+                                )
+                        if old_file_shas_to_remove:
+                            for sha in old_file_shas_to_remove:
+                                index._conn.execute(
+                                    "INSERT INTO files (content_hash, ref_count) "
+                                    "VALUES (?, -1) "
+                                    "ON CONFLICT(content_hash) DO UPDATE "
+                                    "SET ref_count = ref_count - 1",
+                                    (sha,),
+                                )
+                        index._conn.execute(
+                            "UPDATE snapshots SET chunk_count = ?, "
+                            "file_count = ? WHERE id = ?",
+                            (new_chunk_count, new_file_count, snap_id),
+                        )
+                        index._conn.execute("COMMIT")
+                    except Exception:
+                        index._conn.execute("ROLLBACK")
+                        raise
                     report.snapshots_rewritten += 1
                 except Exception as e:
                     report.errors.append(("commit", snap_id, str(e)))
