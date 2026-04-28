@@ -270,6 +270,76 @@ def _unpack_region_cache(blob: bytes) -> list[ChunkRecord]:
     return out
 
 
+def _restore_region_worker(
+    dest_root: Path, dim_key: str, region: "RegionRecord",
+    path_filter: set[str] | None, chunk_store: "ChunkStore",
+) -> tuple[str, str | None]:
+    """Thread-safe region-restore worker.
+
+    Reads every chunk this region references from the pool, packs them,
+    writes the .mca and any .mcc files. Does NOT touch SQLite.
+
+    Returns ``(region_rel, error_or_None)`` so the caller (main thread)
+    can decide how to surface failures. Different regions never share
+    output paths, so writes don't collide between threads.
+    """
+    region_rel = f"{dim_key}/r.{region.rx}.{region.rz}.mca"
+    packed: list[PackedChunk] = []
+    for c in region.chunks:
+        blob = chunk_store.read_chunk(c.content_hash)
+        if blob is None:
+            return region_rel, (
+                f"chunk blob missing: dim={dim_key} ({c.cx},{c.cz}) "
+                f"hash={c.content_hash.hex()}"
+            )
+        payload = blob[1:] if blob else b""
+        if c.compression & EXTERNAL_FLAG:
+            packed.append(PackedChunk(
+                cx=c.cx, cz=c.cz, timestamp=c.timestamp,
+                compression=c.compression, payload=b"",
+            ))
+            world_cx = region.rx * 32 + c.cx
+            world_cz = region.rz * 32 + c.cz
+            mcc_rel = f"{dim_key}/c.{world_cx}.{world_cz}.mcc"
+            if path_filter is None or _path_matches_filter(mcc_rel, path_filter):
+                target = dest_root / mcc_rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+        else:
+            packed.append(PackedChunk(
+                cx=c.cx, cz=c.cz, timestamp=c.timestamp,
+                compression=c.compression, payload=payload,
+            ))
+    if path_filter is None or _path_matches_filter(region_rel, path_filter):
+        region_path = dest_root / region_rel
+        region_path.parent.mkdir(parents=True, exist_ok=True)
+        region_path.write_bytes(pack_region(packed))
+    return region_rel, None
+
+
+def _restore_file_worker(
+    dest_root: Path, file_record: "FileRecord", chunk_store: "ChunkStore",
+) -> tuple[str, str | None]:
+    """Thread-safe non-region file worker.
+
+    Reads the file's content-addressed blob from the pool, writes it to
+    ``dest_root / relative_path``. Different files have distinct paths
+    so writes never collide. ``mkdir(parents=True, exist_ok=True)`` is
+    safe under concurrency: distinct workers may try to create the same
+    parent dir and the OS handles EEXIST.
+    """
+    content = chunk_store.read_file(file_record.sha256)
+    if content is None:
+        return file_record.relative_path, (
+            f"file blob missing for {file_record.relative_path}: "
+            f"{file_record.sha256.hex()}"
+        )
+    target = dest_root / file_record.relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    return file_record.relative_path, None
+
+
 class ChunkRepoError(Exception):
     """Anything that goes wrong in the chunk-store snapshot backend."""
 
@@ -1306,13 +1376,25 @@ class ChunkSnapshotRepo:
         paths: Iterable[str] | None = None,
         *,
         progress_cb: ProgressCallback = None,
+        parallelism: int | None = None,
     ) -> None:
         """Re-materialize a snapshot to ``dest``.
 
         Emits ``restore_regions`` then ``restore_files`` phases so the caller's
         progress bar can show real movement: a TB-scale world's restore can
         take hours, and a bar that reads "0/?" the whole time looks frozen.
+
+        Parallelism: regions + non-region files are restored via a thread
+        pool. Each worker reads from the (immutable) chunk pool and writes
+        to a unique destination path; nothing touches SQLite. Pass
+        ``parallelism=1`` for fully serial; ``None`` auto-resolves to
+        ``min(cpu_count, 8)``. On HDDs the speedup is modest because head
+        seeks dominate; on NVMe it scales nearly linearly with worker
+        count.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os as _os
+
         snap = snapshot if isinstance(snapshot, ChunkSnapshot) else self.get(snapshot)
         if snap is None:
             raise ChunkRepoError(f"No such snapshot: {snapshot!r}")
@@ -1325,121 +1407,179 @@ class ChunkSnapshotRepo:
         total_regions = sum(len(rs) for rs in manifest.dimensions.values())
         total_files = len(manifest.files)
 
+        if parallelism is None:
+            parallelism = min(_os.cpu_count() or 1, 8)
+        parallelism = max(1, parallelism)
+
+        # ---- regions ---------------------------------------------------
+        # Plan first: which regions are filtered out, which need work. The
+        # plan is the same shape in serial and parallel paths so progress
+        # numbering matches.
+        all_regions: list[tuple[str, RegionRecord, str]] = []   # (dim_key, region, rel)
+        for dim_key, regions in manifest.dimensions.items():
+            for region in regions:
+                rel = f"{dim_key}/r.{region.rx}.{region.rz}.mca"
+                all_regions.append((dim_key, region, rel))
+
+        def _region_is_active(dim_key: str, region: RegionRecord, rel: str) -> bool:
+            if path_filter is None:
+                return True
+            if _path_matches_filter(rel, path_filter):
+                return True
+            # filter targets an mcc inside this region — still need to
+            # restore so the matching .mcc gets written.
+            return any(
+                _path_matches_filter(
+                    f"{dim_key}/c.{region.rx*32+c.cx}.{region.rz*32+c.cz}.mcc",
+                    path_filter,
+                ) for c in region.chunks if c.external
+            )
+
         if total_regions:
             _emit(progress_cb, ProgressEvent(
                 kind="phase_start", phase="restore_regions",
                 label=f"{total_regions} region files → {dest_path.name}",
                 total=total_regions,
             ))
-        region_i = 0
-        for dim_key, regions in manifest.dimensions.items():
-            for region in regions:
+
+        if parallelism == 1:
+            # Serial path — kept distinct from parallel so test runs that
+            # demand deterministic ordering (and downstream code that wants
+            # to step through a debugger) still get linear behavior.
+            region_i = 0
+            for dim_key, region, rel in all_regions:
                 region_i += 1
-                rel = f"{dim_key}/r.{region.rx}.{region.rz}.mca"
-                if path_filter is not None and not _path_matches_filter(rel, path_filter):
-                    # Restore the .mca even if the filter targets only an mcc
-                    # if any of this region's external chunks would be needed
-                    if not any(
-                        _path_matches_filter(
-                            f"{dim_key}/c.{region.rx*32+c.cx}.{region.rz*32+c.cz}.mcc",
-                            path_filter,
-                        ) for c in region.chunks if c.external
-                    ):
-                        _emit(progress_cb, ProgressEvent(
-                            kind="phase_progress", phase="restore_regions",
-                            label=f"skip {rel}",
-                            current=region_i, total=total_regions,
-                        ))
-                        continue
-                self._restore_region(dest_path, dim_key, region, path_filter)
+                if not _region_is_active(dim_key, region, rel):
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="restore_regions",
+                        label=f"skip {rel}",
+                        current=region_i, total=total_regions,
+                    ))
+                    continue
+                _, err = _restore_region_worker(
+                    dest_path, dim_key, region, path_filter, self.chunks,
+                )
+                if err is not None:
+                    raise ChunkRepoError(err)
                 _emit(progress_cb, ProgressEvent(
                     kind="phase_progress", phase="restore_regions",
                     label=rel, current=region_i, total=total_regions,
                 ))
+        else:
+            active_regions: list[tuple[str, RegionRecord, str]] = []
+            skipped_rels: list[str] = []
+            for dim_key, region, rel in all_regions:
+                if _region_is_active(dim_key, region, rel):
+                    active_regions.append((dim_key, region, rel))
+                else:
+                    skipped_rels.append(rel)
+            completed = 0
+            for rel in skipped_rels:
+                completed += 1
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="restore_regions",
+                    label=f"skip {rel}",
+                    current=completed, total=total_regions,
+                ))
+            if active_regions:
+                with ThreadPoolExecutor(max_workers=parallelism) as pool:
+                    futures = {
+                        pool.submit(
+                            _restore_region_worker,
+                            dest_path, dim_key, region, path_filter, self.chunks,
+                        ): rel
+                        for dim_key, region, rel in active_regions
+                    }
+                    for future in as_completed(futures):
+                        rel_done, err = future.result()
+                        completed += 1
+                        if err is not None:
+                            for f_ in futures:
+                                f_.cancel()
+                            raise ChunkRepoError(err)
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="restore_regions",
+                            label=rel_done, current=completed, total=total_regions,
+                        ))
+
         if total_regions:
             _emit(progress_cb, ProgressEvent(
                 kind="phase_done", phase="restore_regions",
                 current=total_regions, total=total_regions,
             ))
 
+        # ---- non-region files ------------------------------------------
         if total_files:
             _emit(progress_cb, ProgressEvent(
                 kind="phase_start", phase="restore_files",
                 label=f"{total_files} non-region files",
                 total=total_files,
             ))
-        file_i = 0
-        for f in manifest.files:
-            file_i += 1
-            if path_filter is not None and not _path_matches_filter(
-                f.relative_path, path_filter,
-            ):
+
+        if parallelism == 1:
+            file_i = 0
+            for f in manifest.files:
+                file_i += 1
+                if path_filter is not None and not _path_matches_filter(
+                    f.relative_path, path_filter,
+                ):
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="restore_files",
+                        label=f"skip {f.relative_path}",
+                        current=file_i, total=total_files,
+                    ))
+                    continue
+                _, err = _restore_file_worker(dest_path, f, self.chunks)
+                if err is not None:
+                    raise ChunkRepoError(err)
                 _emit(progress_cb, ProgressEvent(
                     kind="phase_progress", phase="restore_files",
-                    label=f"skip {f.relative_path}",
+                    label=f.relative_path,
                     current=file_i, total=total_files,
                 ))
-                continue
-            content = self.chunks.read_file(f.sha256)
-            if content is None:
-                raise ChunkRepoError(
-                    f"file blob missing for {f.relative_path}: {f.sha256.hex()}"
-                )
-            target = dest_path / f.relative_path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-            _emit(progress_cb, ProgressEvent(
-                kind="phase_progress", phase="restore_files",
-                label=f.relative_path,
-                current=file_i, total=total_files,
-            ))
+        else:
+            active_files: list[FileRecord] = []
+            skipped_paths: list[str] = []
+            for f in manifest.files:
+                if path_filter is None or _path_matches_filter(
+                    f.relative_path, path_filter,
+                ):
+                    active_files.append(f)
+                else:
+                    skipped_paths.append(f.relative_path)
+            completed = 0
+            for rel in skipped_paths:
+                completed += 1
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="restore_files",
+                    label=f"skip {rel}",
+                    current=completed, total=total_files,
+                ))
+            if active_files:
+                with ThreadPoolExecutor(max_workers=parallelism) as pool:
+                    futures = {
+                        pool.submit(
+                            _restore_file_worker, dest_path, f, self.chunks,
+                        ): f.relative_path
+                        for f in active_files
+                    }
+                    for future in as_completed(futures):
+                        path_done, err = future.result()
+                        completed += 1
+                        if err is not None:
+                            for f_ in futures:
+                                f_.cancel()
+                            raise ChunkRepoError(err)
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="restore_files",
+                            label=path_done, current=completed, total=total_files,
+                        ))
+
         if total_files:
             _emit(progress_cb, ProgressEvent(
                 kind="phase_done", phase="restore_files",
                 current=total_files, total=total_files,
             ))
-
-    def _restore_region(
-        self, dest_root: Path, dim_key: str,
-        region: RegionRecord, path_filter: set[str] | None,
-    ) -> None:
-        region_rel = f"{dim_key}/r.{region.rx}.{region.rz}.mca"
-        packed: list[PackedChunk] = []
-        # We always emit the whole region file (chunks within the same region
-        # share the same .mca on disk; selectively writing parts isn't
-        # meaningful). Filtering is at the region/mcc granularity.
-        for c in region.chunks:
-            blob = self.chunks.read_chunk(c.content_hash)
-            if blob is None:
-                raise ChunkRepoError(
-                    f"chunk blob missing: dim={dim_key} ({c.cx},{c.cz}) "
-                    f"hash={c.content_hash.hex()}"
-                )
-            # First byte is the masked compression scheme; rest is the payload
-            # bytes that hash_chunk consumed when this chunk was stored.
-            payload = blob[1:] if blob else b""
-            if c.compression & EXTERNAL_FLAG:
-                # External chunk: empty stub in MCA + write .mcc separately
-                packed.append(PackedChunk(
-                    cx=c.cx, cz=c.cz, timestamp=c.timestamp,
-                    compression=c.compression, payload=b"",
-                ))
-                world_cx = region.rx * 32 + c.cx
-                world_cz = region.rz * 32 + c.cz
-                mcc_rel = f"{dim_key}/c.{world_cx}.{world_cz}.mcc"
-                if path_filter is None or _path_matches_filter(mcc_rel, path_filter):
-                    target = dest_root / mcc_rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(payload)
-            else:
-                packed.append(PackedChunk(
-                    cx=c.cx, cz=c.cz, timestamp=c.timestamp,
-                    compression=c.compression, payload=payload,
-                ))
-        if path_filter is None or _path_matches_filter(region_rel, path_filter):
-            region_path = dest_root / region_rel
-            region_path.parent.mkdir(parents=True, exist_ok=True)
-            region_path.write_bytes(pack_region(packed))
 
     # ---- diff between snapshots --------------------------------------------
 

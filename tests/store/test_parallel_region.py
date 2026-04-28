@@ -138,6 +138,89 @@ def test_parallel_restore_byte_identical(tmp_path: Path):
     assert report.passed, report.summary()
 
 
+@pytest.mark.parametrize("parallelism", [1, 2, 4, 8])
+def test_restore_parallel_equivalent_to_serial(tmp_path: Path, parallelism: int):
+    """Restore at parallelism=N must produce the same destination tree,
+    byte-for-byte, as parallelism=1. Workers race on the chunk pool reads
+    + on parent-directory creation; this is the core safety check."""
+    world = _world_with_n_regions(tmp_path, n=8)
+    vault = tmp_path / "vault"
+    repo = ChunkSnapshotRepo(vault)
+    repo.init()
+    # Add some non-region files to also exercise the file-restore path.
+    pd = world / "playerdata"
+    pd.mkdir()
+    (pd / "alice.dat").write_bytes(b"alice-nbt-bytes")
+    (pd / "bob.dat").write_bytes(b"bob-nbt-bytes" * 200)
+    snap = repo.snapshot(world, label="x", parallelism=8,
+                         verify_roundtrip=False)
+
+    restore_serial = tmp_path / "rest-serial"
+    repo.restore(snap, restore_serial, parallelism=1)
+    restore_par = tmp_path / f"rest-par{parallelism}"
+    repo.restore(snap, restore_par, parallelism=parallelism)
+
+    # Compare every file in both restore trees byte-for-byte.
+    serial_files = sorted(p.relative_to(restore_serial)
+                          for p in restore_serial.rglob("*") if p.is_file())
+    par_files = sorted(p.relative_to(restore_par)
+                       for p in restore_par.rglob("*") if p.is_file())
+    assert serial_files == par_files, (
+        f"file set differs at parallelism={parallelism}: "
+        f"serial-only={set(serial_files) - set(par_files)}, "
+        f"par-only={set(par_files) - set(serial_files)}"
+    )
+    for rel in serial_files:
+        a = (restore_serial / rel).read_bytes()
+        b = (restore_par / rel).read_bytes()
+        assert a == b, (
+            f"{rel} differs at parallelism={parallelism} "
+            f"(serial: {len(a)} B, parallel: {len(b)} B)"
+        )
+
+
+def test_restore_parallel_with_path_filter(tmp_path: Path):
+    """The path filter must work the same under parallelism. Restoring
+    only one region should produce that region (and its mcc files if any)
+    and nothing else."""
+    world = _world_with_n_regions(tmp_path, n=4)
+    vault = tmp_path / "vault"
+    repo = ChunkSnapshotRepo(vault)
+    repo.init()
+    snap = repo.snapshot(world, label="x", parallelism=4,
+                         verify_roundtrip=False)
+
+    restore = tmp_path / "restored"
+    repo.restore(snap, restore, paths=["region/r.-2.-2.mca"], parallelism=4)
+    # Only that region file should exist.
+    files = sorted(p.relative_to(restore).as_posix()
+                   for p in restore.rglob("*") if p.is_file())
+    assert files == ["region/r.-2.-2.mca"], files
+
+
+def test_restore_parallelism_one_unchanged_behavior(tmp_path: Path):
+    """parallelism=1 must produce the same output as the legacy serial path
+    (regression guard for any divergence introduced by the dispatch
+    refactor)."""
+    from chunkvault.store.roundtrip import compare_directories
+    from chunkvault.store.repo import DEFAULT_EXCLUDE
+
+    world = _world_with_n_regions(tmp_path, n=6)
+    pd = world / "playerdata"
+    pd.mkdir()
+    (pd / "alice.dat").write_bytes(b"alice-nbt-bytes")
+    vault = tmp_path / "vault"
+    repo = ChunkSnapshotRepo(vault)
+    repo.init()
+    snap = repo.snapshot(world, label="x", parallelism=1,
+                         verify_roundtrip=False)
+
+    dest = tmp_path / "restored"
+    repo.restore(snap, dest, parallelism=1)
+    report = compare_directories(world, dest, exclude=DEFAULT_EXCLUDE)
+    assert report.passed, report.summary()
+
+
 def test_parallel_handles_large_region_count(tmp_path: Path):
     """64 regions × 8 chunks each = 512 chunks. Stress the pool a bit
     to flush out any thread-pool sequencing assumptions."""
