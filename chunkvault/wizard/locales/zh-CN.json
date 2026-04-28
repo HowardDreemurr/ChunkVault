@@ -239,5 +239,24 @@
   "lang.current": "当前语言:{locale}",
   "lang.choose": "选择一种语言",
   "lang.changed": "语言已切换为 {locale}。已保存到 {path}。",
-  "lang.review_needed_marker": "(需校对)"
+  "lang.review_needed_marker": "(需校对)",
+
+  "phase.repair_scan.reading": "读取 {count} 个 manifest",
+  "phase.repair_apply.label": "删除 {dels} 个重复 + 重新对齐 {retimes} 个时间戳",
+  "phase.migrate_mca_scan.reading": "读取 {count} 个 manifest",
+  "phase.migrate_mca_apply.label": "迁移 {files} 个文件,涉及 {snaps} 个快照",
+  "phase.backfill_region_cache.label": "{count} 个 region 来自快照 {snapshot}",
+  "phase.snapshot.label": "快照 {world}(ts={ts},来源={source})",
+  "phase.regions.label": "region 文件",
+  "phase.scan_files.label": "扫描世界树,查找非 region 文件",
+  "phase.scan_files.found": "找到 {count} 个文件",
+  "phase.files.label": "非 region 文件",
+  "phase.write_manifest.label": "{name}({chunks} chunks)",
+  "phase.update_index.label": "refcount {chunks} chunks + {files} files",
+  "phase.render_tiles.label": "{count} 个 (chunk, mode) 对,分 {groups} 组",
+  "phase.render_tiles.cached": "{dim}/{mode}(已缓存)",
+  "phase.compare_regions.label": "对比 chunk",
+  "phase.compare_files.label": "对比非 region 文件",
+  "phase.restore_regions.label": "{count} 个 region 文件 → {dest}",
+  "phase.logs.label": "采集日志"
 }

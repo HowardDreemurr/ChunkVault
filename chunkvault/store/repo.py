@@ -190,6 +190,12 @@ class RepairReport:
     # This is the "rescue" path for snapshots taken before chunkvault
     # started reading LastPlayed at ingest time.
     recovered_from_pool: int = 0
+    # Snapshots whose index row's timestamp/label disagrees with the
+    # manifest header — typically because a previous repair was Ctrl+C'd
+    # between manifest write (atomic, succeeded) and the SQL update.
+    # On apply we sync index ← manifest (manifest is authoritative).
+    index_lag_to_reconcile: int = 0
+    index_lag_reconciled: int = 0
     no_last_played: list[tuple[str, str]] = field(default_factory=list)  # (id, label)
     unreadable: list[tuple[str, str]] = field(default_factory=list)      # (id, error)
     to_retime: list[RetimePlan] = field(default_factory=list)
@@ -204,12 +210,15 @@ class RepairReport:
     def summary(self) -> str:
         verdict = (
             "APPLIED" if self.applied else
-            ("CLEAN" if not (self.to_retime or self.to_delete) else "DRY-RUN")
+            ("CLEAN"
+             if not (self.to_retime or self.to_delete or self.index_lag_to_reconcile)
+             else "DRY-RUN")
         )
         return (
             f"{verdict}  scanned={self.scanned}, correct={self.already_correct}, "
             f"need_retime={len(self.to_retime)}, "
             f"recovered_from_pool={self.recovered_from_pool}, "
+            f"index_lag={self.index_lag_to_reconcile}, "
             f"duplicate_groups={len(self.duplicate_groups)}, "
             f"to_delete={len(self.to_delete)}, "
             f"no_last_played={len(self.no_last_played)}, "
@@ -1768,10 +1777,11 @@ class ChunkSnapshotRepo:
         report = RepairReport()
         all_snaps = self.list()
         report.scanned = len(all_snaps)
+        from ..wizard.i18n import t as _t
 
         _emit(progress_cb, ProgressEvent(
             kind="phase_start", phase="repair_scan",
-            label=f"reading {len(all_snaps)} manifests",
+            label=_t("phase.repair_scan.reading", count=len(all_snaps)),
             total=len(all_snaps),
         ))
 
@@ -1782,6 +1792,12 @@ class ChunkSnapshotRepo:
         # apply we'll persist it back to the manifest so future runs see
         # the field directly.
         plans: list[tuple[ChunkSnapshot, int, int | None, int | None]] = []
+        # Snapshots whose manifest header disagrees with the index row
+        # (timestamp_ms or label) — typically the result of a Ctrl+C
+        # between manifest write and SQL update in a previous repair.
+        # These need an index-only reconciliation; the manifest is
+        # authoritative because it's the durable per-snapshot file.
+        index_lag: list[tuple[str, int, str]] = []   # (id, manifest_ts_ms, manifest_label)
         for i, snap in enumerate(all_snaps, 1):
             try:
                 manifest = read_manifest(snap.manifest_path)
@@ -1793,6 +1809,15 @@ class ChunkSnapshotRepo:
                 ))
                 continue
             current_ts_ms = manifest.header.timestamp_ms
+            manifest_label = manifest.header.label or ""
+
+            # Detect index-vs-manifest desync. snap.timestamp comes from the
+            # index; manifest.header.timestamp_ms is the durable truth.
+            index_ts_ms = int(snap.timestamp.timestamp() * 1000)
+            index_label = snap.label or ""
+            if index_ts_ms != current_ts_ms or index_label != manifest_label:
+                index_lag.append((snap.id, current_ts_ms, manifest_label))
+
             lp_ms = manifest.header.last_played_ms
             recovered: int | None = None
             if not lp_ms:
@@ -1813,6 +1838,7 @@ class ChunkSnapshotRepo:
                 kind="phase_progress", phase="repair_scan",
                 current=i, total=len(all_snaps),
             ))
+        report.index_lag_to_reconcile = len(index_lag)
 
         # Group by (world_name, target_ts_ms) for those that have a target.
         groups: dict[tuple[str, int], list[tuple[ChunkSnapshot, int]]] = {}
@@ -1885,8 +1911,9 @@ class ChunkSnapshotRepo:
         # collisions with snapshots that are about to disappear anyway.
         _emit(progress_cb, ProgressEvent(
             kind="phase_start", phase="repair_apply",
-            label=f"deleting {len(report.to_delete)} duplicates "
-                  f"+ retiming {len(report.to_retime)}",
+            label=_t("phase.repair_apply.label",
+                     dels=len(report.to_delete),
+                     retimes=len(report.to_retime)),
             total=len(report.to_delete) + len(report.to_retime),
         ))
         applied = 0
@@ -1928,6 +1955,22 @@ class ChunkSnapshotRepo:
                     self._persist_last_played_ms_with_index(snap_id, lp, index)
                 except Exception as e:
                     report.errors.append(("persist_lp", snap_id, str(e)))
+            # Reconcile index-lag (snapshots whose index row was left stale
+            # by a Ctrl+C between manifest write and SQL update in a prior
+            # repair). Manifest is authoritative; index is just a cache.
+            for snap_id, manifest_ts_ms, manifest_label in index_lag:
+                if snap_id in retime_plan_ids:
+                    continue   # _apply_retime_plan already wrote the index
+                try:
+                    with index._conn:
+                        index._conn.execute(
+                            "UPDATE snapshots SET timestamp_ms = ?, label = ? "
+                            "WHERE id = ?",
+                            (manifest_ts_ms, manifest_label, snap_id),
+                        )
+                    report.index_lag_reconciled += 1
+                except Exception as e:
+                    report.errors.append(("reconcile_index", snap_id, str(e)))
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="repair_apply",
             current=applied,
@@ -2299,16 +2342,31 @@ class ChunkSnapshotRepo:
         if recovered_lp is not None:
             manifest.header.last_played_ms = recovered_lp
 
-        # Single atomic write
+        # Single atomic write of the manifest
         write_manifest(snap.manifest_path, manifest)
 
-        # Index updates (single connection, batched)
-        index.update_snapshot_timestamp(
-            plan.snap_id, new_ts_ms,
-            original_timestamp_ms=new_original if first_retime else None,
-        )
-        if plan.new_label != plan.old_label:
-            index.update_snapshot_label(plan.snap_id, plan.new_label)
+        # Index updates: one SQL transaction so a Ctrl+C between the ts
+        # update and the label update can't leave them desynced. Either
+        # both apply or neither does. (Manifest is already on disk; if
+        # this txn fails or is interrupted, the next repair detects the
+        # manifest-vs-index mismatch via the index_lag scan and reconciles.)
+        with index._conn:
+            if first_retime:
+                index._conn.execute(
+                    "UPDATE snapshots SET timestamp_ms = ?, "
+                    "original_timestamp_ms = ? WHERE id = ?",
+                    (new_ts_ms, new_original, plan.snap_id),
+                )
+            else:
+                index._conn.execute(
+                    "UPDATE snapshots SET timestamp_ms = ? WHERE id = ?",
+                    (new_ts_ms, plan.snap_id),
+                )
+            if plan.new_label != plan.old_label:
+                index._conn.execute(
+                    "UPDATE snapshots SET label = ? WHERE id = ?",
+                    (plan.new_label, plan.snap_id),
+                )
 
     def _rename_snapshot_label(self, snap_id: str, new_label: str) -> None:
         """Persist a label rename to both the manifest header and the index

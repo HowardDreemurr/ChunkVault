@@ -239,5 +239,24 @@
   "lang.current": "Current language: {locale}",
   "lang.choose": "Choose a language",
   "lang.changed": "Language changed to {locale}. Saved to {path}.",
-  "lang.review_needed_marker": "(review needed)"
+  "lang.review_needed_marker": "(review needed)",
+
+  "phase.repair_scan.reading": "reading {count} manifests",
+  "phase.repair_apply.label": "deleting {dels} duplicates + retiming {retimes}",
+  "phase.migrate_mca_scan.reading": "reading {count} manifests",
+  "phase.migrate_mca_apply.label": "migrating {files} files across {snaps} snapshots",
+  "phase.backfill_region_cache.label": "{count} regions from {snapshot}",
+  "phase.snapshot.label": "snapshot {world} (ts={ts}, source={source})",
+  "phase.regions.label": "region files",
+  "phase.scan_files.label": "walking world tree for non-region files",
+  "phase.scan_files.found": "found {count} files",
+  "phase.files.label": "non-region files",
+  "phase.write_manifest.label": "{name} ({chunks} chunks)",
+  "phase.update_index.label": "refcount {chunks} chunks + {files} files",
+  "phase.render_tiles.label": "{count} (chunk, mode) pairs across {groups} groups",
+  "phase.render_tiles.cached": "{dim}/{mode} (cached)",
+  "phase.compare_regions.label": "comparing chunks",
+  "phase.compare_files.label": "comparing non-region files",
+  "phase.restore_regions.label": "{count} region files → {dest}",
+  "phase.logs.label": "capturing logs"
 }

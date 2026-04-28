@@ -316,6 +316,50 @@ def test_repair_skips_snapshots_without_last_played(tmp_path: Path):
     assert repo.get(snap.id) is not None
 
 
+def test_repair_reconciles_index_lag_after_simulated_ctrl_c(tmp_path: Path):
+    """Chaos: a previous repair was Ctrl+C'd between manifest write
+    (atomic, succeeded) and the SQL update — leaving manifest=new and
+    index=old. Subsequent repair must detect the desync and sync the
+    index from the manifest (manifest is authoritative)."""
+    repo = ChunkSnapshotRepo(tmp_path / "repo")
+    repo.init()
+    lp = 1_700_000_000_000
+    world = _seed_world(tmp_path, "EX-Server", last_played_ms=lp)
+    snap = repo.snapshot(world, label="x", world_name="EX-Server")
+
+    # Now simulate that a prior repair wrote the manifest with a NEW
+    # ts/label but its index update never landed — a Ctrl+C window.
+    new_ts_ms = lp                          # what manifest was set to
+    new_label = "EX-Server-2023-11-14-22-13-20"
+    m = read_manifest(snap.manifest_path)
+    m.header.timestamp_ms = new_ts_ms
+    m.header.label = new_label
+    write_manifest(snap.manifest_path, m)
+    # Index keeps OLD ts and OLD label — pretend SQL update never happened
+    old_ts_ms = 1_900_000_000_000
+    with IndexDB(repo.index_path) as idx:
+        idx._conn.execute(
+            "UPDATE snapshots SET timestamp_ms = ?, label = ? WHERE id = ?",
+            (old_ts_ms, "EX-Server-2030-03-17-17-46-40", snap.id),
+        )
+        idx._conn.commit()
+
+    # Now run repair: should detect index lag and reconcile it.
+    dry = repo.repair_timestamps(dry_run=True)
+    assert dry.index_lag_to_reconcile == 1
+    # Manifest's ts already equals last_played_ms, so no retime is needed.
+    assert len(dry.to_retime) == 0
+
+    result = repo.repair_timestamps(dry_run=False)
+    assert result.applied
+    assert result.index_lag_reconciled == 1
+
+    # After reconciliation, index reflects manifest
+    fixed = repo.get(snap.id)
+    assert int(fixed.timestamp.timestamp() * 1000) == new_ts_ms
+    assert fixed.label == new_label
+
+
 def test_repair_already_correct_is_noop(tmp_path: Path):
     repo = ChunkSnapshotRepo(tmp_path / "repo")
     repo.init()
