@@ -58,6 +58,29 @@ _RENDER_PROGRESS_TICK = 256
 _RENDER_COMMIT_BATCH = 1024
 
 
+def _render_one_tile(
+    h: bytes, mode: str,
+    chunk_store, tile_store,
+) -> tuple[bytes, str, bool]:
+    """Render one (chunk_hash, mode) tile to the tile pool.
+
+    Returns (h, mode, ok). Thread-safe: chunk_store/tile_store
+    operations are filesystem-only with atomic writes; PIL + zlib
+    release the GIL for the heavy work. Used by both the serial
+    inner loop and the parallel worker pool.
+    """
+    blob = chunk_store.read_chunk(h)
+    if blob is None or len(blob) < 1:
+        return (h, mode, False)
+    try:
+        nbt = decompress_chunk_payload(blob[0] & ~EXTERNAL_FLAG, blob[1:])
+        tile = render_chunk_nbt(nbt, mode)
+        tile_store.store(h, mode, tile)
+        return (h, mode, True)
+    except (RenderError, Exception):
+        return (h, mode, False)
+
+
 def modes_for_dim(dim_key: str) -> tuple[str, ...]:
     """Which render modes apply to a given dimension's region key."""
     # Nether's bedrock ceiling makes a single "top-down" view useless;
@@ -81,6 +104,7 @@ def ensure_tiles_for_manifest(
     manifest,                   # chunkvault.store.manifest.Manifest
     *,
     progress_cb: ProgressCallback = None,
+    parallelism: int | None = None,
 ) -> TileRenderStats:
     """Walk a manifest and render any missing tiles into the tile pool.
 
@@ -119,6 +143,14 @@ def ensure_tiles_for_manifest(
     progress_tick = _RENDER_PROGRESS_TICK
     commit_batch = _RENDER_COMMIT_BATCH
 
+    # Resolve parallelism. None → auto. Cap at 8 — past that, GIL +
+    # PIL contention kills further gains for tile rendering. Pass
+    # parallelism=1 to force serial.
+    import os as _os
+    if parallelism is None:
+        parallelism = min(_os.cpu_count() or 1, 8)
+    parallelism = max(1, parallelism)
+
     seen = 0
     with __import__("chunkvault.store.index", fromlist=["IndexDB"]).IndexDB(
         repo.index_path,
@@ -138,46 +170,79 @@ def ensure_tiles_for_manifest(
                     label=f"{dim_key}/{mode} (cached)",
                     current=seen, total=total_to_check,
                 ))
-            # Buffer for incremental chunk_renders commits.
+
+            if not missing:
+                continue
+
+            # Parallel path: dispatch render-one-tile to a thread pool.
+            # Each worker is filesystem-only (read chunk blob → decompress
+            # NBT → render PNG → write tile blob); zlib + PIL release the
+            # GIL for their hot loops, so we get real concurrency. Only
+            # the chunk_renders index updates happen back in the main
+            # thread, batched.
             uncommitted: list[bytes] = []
-            for i, h in enumerate(missing, 1):
-                blob = repo.chunks.read_chunk(h)
-                rendered_ok = False
-                if blob is None or len(blob) < 1:
-                    stats.chunks_failed += 1
-                else:
-                    try:
-                        nbt = decompress_chunk_payload(
-                            blob[0] & ~EXTERNAL_FLAG, blob[1:],
+
+            def _flush_uncommitted():
+                """Push buffered hashes into chunk_renders. Captured by
+                closure so both the serial and parallel branches share
+                the same persistence cadence."""
+                if uncommitted:
+                    index.add_chunk_renders(
+                        [(uh, mode) for uh in uncommitted],
+                    )
+                    uncommitted.clear()
+
+            if parallelism > 1 and len(missing) > 1:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                processed_in_group = 0
+                with ThreadPoolExecutor(max_workers=parallelism) as pool:
+                    futures = [
+                        pool.submit(
+                            _render_one_tile, h, mode,
+                            repo.chunks, repo.tiles,
                         )
-                        tile = render_chunk_nbt(nbt, mode)
-                        repo.tiles.store(h, mode, tile)
+                        for h in missing
+                    ]
+                    for future in as_completed(futures):
+                        h, _mode, ok = future.result()
+                        processed_in_group += 1
+                        if ok:
+                            stats.tiles_rendered += 1
+                            uncommitted.append(h)
+                            if len(uncommitted) >= commit_batch:
+                                _flush_uncommitted()
+                        else:
+                            stats.chunks_failed += 1
+                        seen += 1
+                        if processed_in_group % progress_tick == 0:
+                            _emit(progress_cb, ProgressEvent(
+                                kind="phase_progress", phase="render_tiles",
+                                label=f"{dim_key}/{mode}",
+                                current=seen, total=total_to_check,
+                            ))
+            else:
+                # Serial path (parallelism=1 or single missing tile)
+                for i, h in enumerate(missing, 1):
+                    _h, _mode, ok = _render_one_tile(
+                        h, mode, repo.chunks, repo.tiles,
+                    )
+                    if ok:
                         stats.tiles_rendered += 1
-                        rendered_ok = True
-                    except (RenderError, Exception):
+                        uncommitted.append(h)
+                        if len(uncommitted) >= commit_batch:
+                            _flush_uncommitted()
+                    else:
                         stats.chunks_failed += 1
-                if rendered_ok:
-                    uncommitted.append(h)
-                    if len(uncommitted) >= commit_batch:
-                        # Persist in batches so a Ctrl+C only loses up to
-                        # commit_batch entries, not the entire group.
-                        index.add_chunk_renders(
-                            [(uh, mode) for uh in uncommitted],
-                        )
-                        uncommitted.clear()
-                seen += 1
-                # Emit during the inner loop so a multi-million-chunk group
-                # doesn't appear frozen. Branch is cheap; _emit only runs
-                # once per tick.
-                if i % progress_tick == 0:
-                    _emit(progress_cb, ProgressEvent(
-                        kind="phase_progress", phase="render_tiles",
-                        label=f"{dim_key}/{mode}",
-                        current=seen, total=total_to_check,
-                    ))
+                    seen += 1
+                    if i % progress_tick == 0:
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="render_tiles",
+                            label=f"{dim_key}/{mode}",
+                            current=seen, total=total_to_check,
+                        ))
+
             # Final flush for the group's tail.
-            if uncommitted:
-                index.add_chunk_renders([(uh, mode) for uh in uncommitted])
+            _flush_uncommitted()
             _emit(progress_cb, ProgressEvent(
                 kind="phase_progress", phase="render_tiles",
                 label=f"{dim_key}/{mode}",

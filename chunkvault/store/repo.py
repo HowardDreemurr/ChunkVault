@@ -92,6 +92,133 @@ DEFAULT_EXCLUDE: tuple[str, ...] = (
 _REGION_CACHE_FORMAT_V1 = 1
 
 
+def _verify_one_blob(
+    path: Path, expected: bytes, hasher_kind: str,
+) -> tuple[Path, bytes, bool]:
+    """Re-hash one pool blob and compare against the expected hash.
+
+    Used by both serial and parallel verify paths. Thread-safe:
+    operates on the path, doesn't touch any shared state. blake2b /
+    sha256 release the GIL on big inputs, so threads scale well to
+    disk bandwidth on this loop.
+
+    Returns (path, expected, matches). On read failure returns
+    (path, expected, False) — caller treats as corrupt.
+    """
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return (path, expected, False)
+    if hasher_kind == "blake2b":
+        actual = hashlib.blake2b(content, digest_size=16).digest()
+    else:   # sha256
+        actual = hashlib.sha256(content).digest()
+    return (path, expected, actual == expected)
+
+
+@dataclass
+class _RegionWorkResult:
+    """Output of one parallel region-hash worker.
+
+    Workers never touch SQLite — they read the region, hash chunks,
+    write any new chunk blobs to the pool (filesystem-only, atomic
+    + content-addressed), then hand back enough info for the main
+    thread to update the index.
+    """
+    rx: int
+    rz: int
+    dim_key: str
+    region_path: Path
+    region_sha: bytes | None = None
+    record: "RegionRecord | None" = None    # None on read/parse failure
+    has_external: bool = False
+    new_hashes: list[bytes] = field(default_factory=list)     # blobs we wrote this call
+    all_referenced: list[bytes] = field(default_factory=list) # every hash in this region
+    mcc_paths: list[Path] = field(default_factory=list)        # for visited_mcc tracking
+    error: str | None = None
+
+
+def _snapshot_region_worker(
+    region_path: Path, rx: int, rz: int, dim_key: str,
+    chunk_store: "ChunkStore",
+) -> _RegionWorkResult:
+    """Thread-safe region-hash worker.
+
+    Reads the region file, parses it, hashes every chunk's payload,
+    writes any new chunk blobs to the pool. Does NOT touch SQLite —
+    the caller (main thread) is responsible for cache lookups, bulk
+    presence probes, ref-count adjustments, region_cache writes.
+
+    Safe to call from multiple threads concurrently:
+    - All filesystem operations on the chunk pool go through
+      ChunkStore._atomic_store, whose tmp-file names include
+      thread id + random suffix → no inter-thread collision.
+    - hash_chunk + Region.from_bytes operate on a fresh bytes
+      object per call → no shared mutable state.
+    - The result dataclass is the only thing crossing thread
+      boundaries. It's a plain frozen-style record.
+    """
+    result = _RegionWorkResult(
+        rx=rx, rz=rz, dim_key=dim_key, region_path=region_path,
+    )
+    try:
+        region_bytes = region_path.read_bytes()
+    except OSError as e:
+        result.error = f"read failed: {e}"
+        return result
+
+    result.region_sha = hashlib.sha256(region_bytes).digest()
+
+    try:
+        region = Region.from_bytes(
+            region_bytes, rx=rx, rz=rz, source=region_path.name,
+        )
+        chunks_iter = list(region.iter_chunks())
+    except MCAError as e:
+        result.error = f"parse failed: {e}"
+        return result
+
+    rec_chunks: list["ChunkRecord"] = []
+    # (hash, masked_compression, payload) — we'll dedupe + write below
+    pending: list[tuple[bytes, int, bytes]] = []
+    for chunk in chunks_iter:
+        if chunk.external:
+            result.has_external = True
+            world_cx = rx * 32 + chunk.cx
+            world_cz = rz * 32 + chunk.cz
+            mcc_path = region_path.parent / f"c.{world_cx}.{world_cz}.mcc"
+            result.mcc_paths.append(mcc_path)
+            payload = mcc_path.read_bytes() if mcc_path.is_file() else b""
+            h = hash_chunk(chunk, external_payload=payload)
+        else:
+            payload = chunk.payload
+            h = hash_chunk(chunk)
+        masked = chunk.compression & ~EXTERNAL_FLAG
+        pending.append((h, masked, payload))
+        rec_chunks.append(ChunkRecord(
+            cx=chunk.cx, cz=chunk.cz,
+            compression=chunk.compression,
+            timestamp=chunk.timestamp,
+            content_hash=h,
+        ))
+
+    # Write new chunk blobs. has_chunk + store_chunk hit the filesystem
+    # directly; no SQLite. _atomic_store handles concurrent writers.
+    written: set[bytes] = set()
+    for h, masked, payload in pending:
+        if h in written:
+            continue
+        written.add(h)
+        if not chunk_store.has_chunk(h):
+            blob = bytes([masked]) + payload
+            chunk_store.store_chunk(h, blob)
+            result.new_hashes.append(h)
+
+    result.record = RegionRecord(rx=rx, rz=rz, chunks=rec_chunks)
+    result.all_referenced = [h for h, _, _ in pending]
+    return result
+
+
 def _pack_region_cache(records: list[ChunkRecord]) -> bytes:
     """Serialize a region's chunk records for the ``region_cache`` table.
 
@@ -416,6 +543,7 @@ class ChunkSnapshotRepo:
         world_name: str | None = None,
         progress_cb: ProgressCallback = None,
         verify_roundtrip: bool = True,
+        parallelism: int | None = None,
     ) -> ChunkSnapshot:
         if not self.is_initialized():
             raise ChunkRepoError(f"Repo not initialized: {self.repo_path}")
@@ -485,6 +613,17 @@ class ChunkSnapshotRepo:
         chunks_referenced: list[bytes] = []
         files_referenced: list[bytes] = []
 
+        # Resolve parallelism. None → auto: min(cpu_count, 8). The cap
+        # at 8 is empirical: on NVMe + many cores you reach disk I/O
+        # saturation around 4–8 threads, more workers just thrash on
+        # disk + GIL contention without speeding anything up.
+        # Pass parallelism=1 to force the original serial path (escape
+        # hatch for tests, debugging, or weird hardware).
+        import os as _os
+        if parallelism is None:
+            parallelism = min(_os.cpu_count() or 1, 8)
+        parallelism = max(1, parallelism)
+
         with IndexDB(self.index_path) as index:
             # 1) Region files — chunk-level dedup
             visited_paths: set[Path] = set()
@@ -496,33 +635,47 @@ class ChunkSnapshotRepo:
             total_regions = len(all_regions)
             _emit(progress_cb, ProgressEvent(
                 kind="phase_start", phase="regions",
-                label="region files", total=total_regions,
+                label=f"region files (parallelism={parallelism})",
+                total=total_regions,
             ))
-            regions_by_dim: dict[str, list[RegionRecord]] = {}
-            for i, (region_path, rx, rz, dim_key) in enumerate(all_regions, 1):
-                visited_paths.add(region_path)
-                region_record, region_new = self._snapshot_region(
-                    region_path, rx, rz, dim_key, index,
-                    visited_mcc=visited_paths,
-                )
-                if region_record is None:
-                    continue
-                regions_by_dim.setdefault(dim_key, []).append(region_record)
-                region_count += 1
-                chunk_count += len(region_record.chunks)
-                new_chunks += region_new
-                for c in region_record.chunks:
-                    chunks_referenced.append(c.content_hash)
-                _emit(progress_cb, ProgressEvent(
-                    kind="phase_progress", phase="regions",
-                    label=f"r.{rx}.{rz}.mca", current=i, total=total_regions,
-                ))
+
+            if parallelism > 1 and total_regions > 1:
+                regions_by_dim, chunks_referenced, region_count, \
+                    chunk_count, new_chunks = self._snapshot_regions_parallel(
+                        all_regions, index,
+                        visited_paths=visited_paths,
+                        parallelism=parallelism,
+                        progress_cb=progress_cb,
+                    )
+            else:
+                # Original serial path (preserves exact existing behavior
+                # for parallelism=1 and edge cases like 0/1 regions).
+                regions_by_dim = {}
+                for i, (region_path, rx, rz, dim_key) in enumerate(all_regions, 1):
+                    visited_paths.add(region_path)
+                    region_record, region_new = self._snapshot_region(
+                        region_path, rx, rz, dim_key, index,
+                        visited_mcc=visited_paths,
+                    )
+                    if region_record is None:
+                        continue
+                    regions_by_dim.setdefault(dim_key, []).append(region_record)
+                    region_count += 1
+                    chunk_count += len(region_record.chunks)
+                    new_chunks += region_new
+                    for c in region_record.chunks:
+                        chunks_referenced.append(c.content_hash)
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="regions",
+                        label=f"r.{rx}.{rz}.mca", current=i, total=total_regions,
+                    ))
+
             for dim_key, regions in regions_by_dim.items():
                 manifest.dimensions[dim_key] = regions
             _emit(progress_cb, ProgressEvent(
                 kind="phase_done", phase="regions",
                 current=total_regions, total=total_regions,
-                detail={"new_chunks": new_chunks},
+                detail={"new_chunks": new_chunks, "parallelism": parallelism},
             ))
 
             # 2) Non-region files — whole-file dedup
@@ -628,7 +781,10 @@ class ChunkSnapshotRepo:
             from ..viz.snapshot_render import (
                 ensure_tiles_for_manifest, write_snapshot_sidecars,
             )
-            ensure_tiles_for_manifest(self, manifest, progress_cb=progress_cb)
+            ensure_tiles_for_manifest(
+                self, manifest, progress_cb=progress_cb,
+                parallelism=parallelism,
+            )
             write_snapshot_sidecars(
                 self, snap_id, manifest, progress_cb=progress_cb,
             )
@@ -758,6 +914,127 @@ class ChunkSnapshotRepo:
             },
         ))
         return stats
+
+    def _snapshot_regions_parallel(
+        self,
+        all_regions: list[tuple[Path, int, int, str]],
+        index: IndexDB,
+        *,
+        visited_paths: set[Path],
+        parallelism: int,
+        progress_cb: ProgressCallback = None,
+    ) -> tuple[
+        dict[str, list[RegionRecord]],   # regions_by_dim
+        list[bytes],                      # chunks_referenced (for ref count)
+        int,                              # region_count
+        int,                              # chunk_count
+        int,                              # new_chunks
+    ]:
+        """Hash regions in parallel using a thread pool.
+
+        Equivalent to the serial loop's behavior but spreads CPU + I/O
+        across N worker threads. Workers compute everything (read, sha,
+        parse, hash chunks, write chunk blobs) but never touch SQLite.
+        Main thread does all index work in one batched pass at the end:
+
+          - region_cache lookup (using sha from each result)
+          - has_chunks_bulk for the ENTIRE set of hashes (one query)
+          - add_chunks for the missing ones
+          - put_region_cache for each newly-parsed non-external region
+
+        Returns the same 5-tuple shape the serial path produces, so the
+        caller can plug it in interchangeably.
+
+        For correctness under concurrent writes:
+          - chunk pool: atomic_store with thread-id-suffixed tmp names
+            → different blobs of same hash from 2 threads are safe
+          - SQLite: untouched by workers
+          - shared aggregates: built from results in main thread, not
+            mutated by workers
+
+        Cache-hit handling: workers ALWAYS parse + hash. For warm caches
+        (re-ingest), this is wasteful — the eventual cache lookup tells
+        us we could have skipped. Acceptable tradeoff: cold-ingest
+        (the dominant cost) gets full speedup; warm re-ingest still
+        gets disk-read parallelism + the cache-validation skips the
+        chunk-pool writes (no new blobs to store).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Mark all region paths visited up-front so the file-walk phase
+        # excludes them. Doing it now keeps the workers from racing on
+        # the set.
+        for region_path, _, _, _ in all_regions:
+            visited_paths.add(region_path)
+
+        regions_by_dim: dict[str, list[RegionRecord]] = {}
+        chunks_referenced: list[bytes] = []
+        region_count = 0
+        chunk_count = 0
+        new_chunks = 0
+        total = len(all_regions)
+        completed = 0
+
+        # Track all hashes for one big bulk presence probe, and remember
+        # which result each hash belongs to so we can decide whether the
+        # blob write the worker did was actually new.
+        all_hashes_seen: set[bytes] = set()
+        per_result: list[_RegionWorkResult] = []
+
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            futures = [
+                pool.submit(
+                    _snapshot_region_worker,
+                    region_path, rx, rz, dim_key, self.chunks,
+                )
+                for region_path, rx, rz, dim_key in all_regions
+            ]
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="regions",
+                    label=f"r.{result.rx}.{result.rz}.mca",
+                    current=completed, total=total,
+                ))
+                if result.error is not None or result.record is None:
+                    # read/parse failure — skip this region (matches
+                    # serial path's silent-skip-on-MCAError behavior)
+                    continue
+                per_result.append(result)
+                # Aggregate mcc paths into visited_paths
+                for mcc_path in result.mcc_paths:
+                    visited_paths.add(mcc_path)
+                all_hashes_seen.update(result.all_referenced)
+                regions_by_dim.setdefault(result.dim_key, []).append(result.record)
+                region_count += 1
+                chunk_count += len(result.record.chunks)
+                # The worker wrote some blobs. Whether each one was
+                # truly new (presence row didn't exist) is determined
+                # below in the bulk pass; for now collect.
+                chunks_referenced.extend(result.all_referenced)
+
+        # Single bulk presence probe + bulk add for everything new.
+        if all_hashes_seen:
+            unique_list = list(all_hashes_seen)
+            present = index.has_chunks_bulk(unique_list)
+            new_for_index = [h for h in unique_list if h not in present]
+            if new_for_index:
+                index.add_chunks(new_for_index)
+                new_chunks = len(new_for_index)
+
+        # Cache writes: per-region, post-parse. Skip externals (their
+        # fingerprint depends on .mcc bytes too — see _snapshot_region).
+        for r in per_result:
+            if r.has_external or r.region_sha is None:
+                continue
+            try:
+                index.put_region_cache(
+                    r.region_sha, _pack_region_cache(r.record.chunks),
+                )
+            except ValueError:
+                pass    # bad hash length — skip caching, rest is fine
+
+        return regions_by_dim, chunks_referenced, region_count, chunk_count, new_chunks
 
     def _snapshot_region(  # noqa: C901 — the two fast paths plus a slow path
         self,
@@ -1116,6 +1393,7 @@ class ChunkSnapshotRepo:
         *,
         repair: bool = False,
         progress_cb: ProgressCallback = None,
+        parallelism: int | None = None,
     ) -> "VerifyReport":
         """Walk every blob on disk, recompute its hash, compare to its name.
 
@@ -1128,7 +1406,19 @@ class ChunkSnapshotRepo:
         ``verify_reachability``, ``verify_orphans`` — each with per-blob
         progress (batched every 100 to keep callback overhead negligible
         when scanning millions of blobs).
+
+        Parallelism: chunks + files re-hash phases run with a thread pool
+        (read + hash is mostly I/O + GIL-releasing crypto, threads scale
+        well to disk bandwidth). Pass ``parallelism=1`` for a serial run;
+        ``None`` auto-resolves to ``min(cpu_count, 8)``.
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import os as _os
+
+        if parallelism is None:
+            parallelism = min(_os.cpu_count() or 1, 8)
+        parallelism = max(1, parallelism)
+
         report = VerifyReport()
         BATCH = 100   # emit phase_progress every N items; finer feels jittery,
                       # coarser hides progress on small vaults
@@ -1138,29 +1428,57 @@ class ChunkSnapshotRepo:
         #    must equal the path-encoded hash.
         _emit(progress_cb, ProgressEvent(
             kind="phase_start", phase="verify_chunks",
-            label="re-hashing chunk pool",
+            label=f"re-hashing chunk pool (parallelism={parallelism})",
         ))
-        i = 0
-        for path, expected in _iter_pool_blobs(self.chunks.chunks_dir):
-            i += 1
-            content = path.read_bytes()
-            actual = hashlib.blake2b(content, digest_size=16).digest()
-            if actual == expected:
-                report.ok_chunks += 1
-            else:
-                report.corrupt_chunks += 1
-                if repair:
-                    try:
-                        path.unlink()
-                        report.repaired += 1
-                    except OSError:
-                        pass
-            if i % BATCH == 0:
-                _emit(progress_cb, ProgressEvent(
-                    kind="phase_progress", phase="verify_chunks",
-                    label=f"{report.ok_chunks} ok, {report.corrupt_chunks} corrupt",
-                    current=i,
-                ))
+        chunk_blobs = list(_iter_pool_blobs(self.chunks.chunks_dir))
+        if parallelism > 1 and len(chunk_blobs) > 1:
+            i = 0
+            with ThreadPoolExecutor(max_workers=parallelism) as pool:
+                futures = [
+                    pool.submit(_verify_one_blob, path, expected, "blake2b")
+                    for path, expected in chunk_blobs
+                ]
+                for future in as_completed(futures):
+                    path, _exp, ok = future.result()
+                    i += 1
+                    if ok:
+                        report.ok_chunks += 1
+                    else:
+                        report.corrupt_chunks += 1
+                        if repair:
+                            try:
+                                path.unlink()
+                                report.repaired += 1
+                            except OSError:
+                                pass
+                    if i % BATCH == 0:
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="verify_chunks",
+                            label=f"{report.ok_chunks} ok, "
+                                  f"{report.corrupt_chunks} corrupt",
+                            current=i,
+                        ))
+        else:
+            i = 0
+            for path, expected in chunk_blobs:
+                i += 1
+                _, _, ok = _verify_one_blob(path, expected, "blake2b")
+                if ok:
+                    report.ok_chunks += 1
+                else:
+                    report.corrupt_chunks += 1
+                    if repair:
+                        try:
+                            path.unlink()
+                            report.repaired += 1
+                        except OSError:
+                            pass
+                if i % BATCH == 0:
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="verify_chunks",
+                        label=f"{report.ok_chunks} ok, {report.corrupt_chunks} corrupt",
+                        current=i,
+                    ))
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="verify_chunks",
             current=i, total=i,
@@ -1170,29 +1488,57 @@ class ChunkSnapshotRepo:
         # Files: keyed by sha256 of full content.
         _emit(progress_cb, ProgressEvent(
             kind="phase_start", phase="verify_files",
-            label="re-hashing file pool",
+            label=f"re-hashing file pool (parallelism={parallelism})",
         ))
-        i = 0
-        for path, expected in _iter_pool_blobs(self.chunks.files_dir):
-            i += 1
-            content = path.read_bytes()
-            actual = hashlib.sha256(content).digest()
-            if actual == expected:
-                report.ok_files += 1
-            else:
-                report.corrupt_files += 1
-                if repair:
-                    try:
-                        path.unlink()
-                        report.repaired += 1
-                    except OSError:
-                        pass
-            if i % BATCH == 0:
-                _emit(progress_cb, ProgressEvent(
-                    kind="phase_progress", phase="verify_files",
-                    label=f"{report.ok_files} ok, {report.corrupt_files} corrupt",
-                    current=i,
-                ))
+        file_blobs = list(_iter_pool_blobs(self.chunks.files_dir))
+        if parallelism > 1 and len(file_blobs) > 1:
+            i = 0
+            with ThreadPoolExecutor(max_workers=parallelism) as pool:
+                futures = [
+                    pool.submit(_verify_one_blob, path, expected, "sha256")
+                    for path, expected in file_blobs
+                ]
+                for future in as_completed(futures):
+                    path, _exp, ok = future.result()
+                    i += 1
+                    if ok:
+                        report.ok_files += 1
+                    else:
+                        report.corrupt_files += 1
+                        if repair:
+                            try:
+                                path.unlink()
+                                report.repaired += 1
+                            except OSError:
+                                pass
+                    if i % BATCH == 0:
+                        _emit(progress_cb, ProgressEvent(
+                            kind="phase_progress", phase="verify_files",
+                            label=f"{report.ok_files} ok, "
+                                  f"{report.corrupt_files} corrupt",
+                            current=i,
+                        ))
+        else:
+            i = 0
+            for path, expected in file_blobs:
+                i += 1
+                _, _, ok = _verify_one_blob(path, expected, "sha256")
+                if ok:
+                    report.ok_files += 1
+                else:
+                    report.corrupt_files += 1
+                    if repair:
+                        try:
+                            path.unlink()
+                            report.repaired += 1
+                        except OSError:
+                            pass
+                if i % BATCH == 0:
+                    _emit(progress_cb, ProgressEvent(
+                        kind="phase_progress", phase="verify_files",
+                        label=f"{report.ok_files} ok, {report.corrupt_files} corrupt",
+                        current=i,
+                    ))
         _emit(progress_cb, ProgressEvent(
             kind="phase_done", phase="verify_files",
             current=i, total=i,

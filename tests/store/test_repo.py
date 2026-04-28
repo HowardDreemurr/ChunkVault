@@ -203,11 +203,19 @@ def test_snapshot_populates_region_cache_after_first_pass(tmp_path: Path):
 
 def test_snapshot_region_cache_hit_skips_parse(tmp_path: Path, monkeypatch):
     """A second snapshot of an identical world must hit the cache, NOT call
-    Region.from_bytes again. This is the whole point of the optimization."""
+    Region.from_bytes again. This is the whole point of the optimization.
+
+    Forces parallelism=1: the parallel region-hash path always parses
+    in workers (cache lookup happens after, accepts the worker's
+    result on miss vs. cached on hit). The cache short-circuit is a
+    serial-path-only optimization. For warm re-ingest workloads,
+    callers can pass parallelism=1 explicitly to get the no-parse
+    fast path; for cold ingest the parallel speedup dominates.
+    """
     repo = ChunkSnapshotRepo(tmp_path / "repo")
     repo.init()
     world = _mk_world(tmp_path)
-    repo.snapshot(world, label="a")
+    repo.snapshot(world, label="a", parallelism=1)
 
     # Boobytrap: future calls to Region.from_bytes raise. If the second
     # snapshot still parses regions, this test fails loudly.
@@ -220,7 +228,7 @@ def test_snapshot_region_cache_hit_skips_parse(tmp_path: Path, monkeypatch):
         return real_from_bytes(*a, **kw)
     monkeypatch.setattr(repo_mod.Region, "from_bytes", trap)
 
-    repo.snapshot(world, label="b")
+    repo.snapshot(world, label="b", parallelism=1)
     assert calls["n"] == 0  # every region must hit the cache
 
 

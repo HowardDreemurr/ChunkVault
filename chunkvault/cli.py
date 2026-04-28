@@ -195,7 +195,10 @@ def cmd_import(args: argparse.Namespace) -> int:
 def cmd_verify(args: argparse.Namespace) -> int:
     from .store import ChunkSnapshotRepo
     repo = ChunkSnapshotRepo(args.repo)
-    report = repo.verify(repair=args.repair)
+    report = repo.verify(
+        repair=args.repair,
+        parallelism=getattr(args, "parallelism", None),
+    )
     print(
         f"verify: {report.ok_chunks} chunks ok, "
         f"{report.corrupt_chunks} corrupt, "
@@ -376,6 +379,8 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     if args.store == "chunk":
         # Round-trip verify is opt-OUT: runs by default, --no-verify skips.
         kwargs["verify_roundtrip"] = not args.no_verify
+        if getattr(args, "parallelism", None) is not None:
+            kwargs["parallelism"] = args.parallelism
     if args.timestamp:
         from datetime import datetime, timezone
         try:
@@ -860,6 +865,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "'2024-03-15T10:30:00'). Default: read level.dat's "
                         "LastPlayed, fall back to newest region mtime, then "
                         "to current wall time.")
+    s.add_argument("--parallelism", type=int, default=None, metavar="N",
+                   help="Region-hash + tile-render thread count. Default: "
+                        "auto (min(cpu_count, 8)). Pass 1 for serial.")
     s.set_defaults(func=cmd_snapshot)
 
     ls = sub.add_parser("list", help="List snapshots, newest first.")
@@ -1125,6 +1133,9 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("repo", type=Path)
     v.add_argument("--repair", action="store_true",
                    help="Delete corrupt blobs (will be regenerated on next snapshot).")
+    v.add_argument("--parallelism", type=int, default=None, metavar="N",
+                   help="Re-hash worker thread count. Default: auto "
+                        "(min(cpu_count, 8)). Pass 1 for serial.")
     v.set_defaults(func=cmd_verify)
 
     rt = sub.add_parser("render-tiles",
