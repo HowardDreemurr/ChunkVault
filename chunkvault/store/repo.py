@@ -1467,20 +1467,47 @@ class ChunkSnapshotRepo:
 
         report = FsckReport()
 
-        # 1) Stray temp files everywhere
-        for pool_root in (self.chunks.chunks_dir, self.chunks.files_dir,
-                          self.logs.logs_dir, self.manifests_dir,
-                          self.log_manifests_dir):
+        # 1) Stray temp files everywhere. Glob by name pattern so the OS
+        # does the filter instead of us iterating every file in pools that
+        # may contain millions of chunks. Without this, fsck stage 1 used
+        # to take 5-15 minutes silently on a multi-million-chunk vault.
+        pool_roots = [
+            (self.chunks.chunks_dir, "chunks"),
+            (self.chunks.files_dir, "files"),
+            (self.logs.logs_dir, "logs"),
+            (self.manifests_dir, "manifests"),
+            (self.log_manifests_dir, "log-manifests"),
+        ]
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_start", phase="fsck_stray_tmp",
+            label="scanning pool dirs for stray *.tmp.* files",
+            total=len(pool_roots),
+        ))
+        for i, (pool_root, name) in enumerate(pool_roots, 1):
             if not pool_root.is_dir():
+                _emit(progress_cb, ProgressEvent(
+                    kind="phase_progress", phase="fsck_stray_tmp",
+                    label=f"{name} (skip — not a dir)",
+                    current=i, total=len(pool_roots),
+                ))
                 continue
-            for path in pool_root.rglob("*"):
-                if path.is_file() and ".tmp." in path.name:
+            for path in pool_root.rglob("*.tmp.*"):
+                if path.is_file():
                     report.stray_temp_files.append(str(path))
                     if repair:
                         try:
                             path.unlink()
                         except OSError:
                             pass
+            _emit(progress_cb, ProgressEvent(
+                kind="phase_progress", phase="fsck_stray_tmp",
+                label=f"{name} ({len(report.stray_temp_files)} found so far)",
+                current=i, total=len(pool_roots),
+            ))
+        _emit(progress_cb, ProgressEvent(
+            kind="phase_done", phase="fsck_stray_tmp",
+            current=len(pool_roots), total=len(pool_roots),
+        ))
 
         # 2) Snapshot row ↔ manifest reconciliation
         with IndexDB(self.index_path) as index:
