@@ -43,10 +43,12 @@ def summarize_repo(path: Path | str) -> RepoSummary | None:
     ``detect_environment`` ran — which is on launch AND after every
     operation. Index counts are O(1) per table.
 
-    ``on_disk_bytes`` is similarly derived from the index where possible
-    (sum of chunk_count across snapshots × estimated avg, fallback 0)
-    rather than rglob'ing the whole tree. We give up some accuracy for
-    a 1000x speedup on large vaults.
+    ``on_disk_bytes`` here is **metadata only** — index.sqlite + manifests/
+    bytes — NOT the real vault size. The chunk/file/log pools dominate
+    actual disk usage but rglob'ing them every wizard launch took minutes
+    on multi-million-blob vaults. The wizard relabels this column as
+    "metadata" to avoid the misleading "17 GB on a 557 GB vault" surprise;
+    callers who need true size should call `du`/equivalent themselves.
     """
     p = Path(path)
     if not p.is_dir():
