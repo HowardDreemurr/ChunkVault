@@ -270,26 +270,86 @@ def _menu_choice(label_key: str, hint_key: str | None, value: str):
 
 
 def _build_menu_choices() -> list:
+    """Top-level menu: 6 most-common operations + 4 submenu groups + quit.
+
+    Categorised because flat 17-item lists are hostile UX, especially when
+    half the items are diagnostics or recovery tools used once a quarter.
+    The grouping is workflow-driven:
+
+      direct actions       — daily use
+      ── health           — periodic maintenance
+      ── repair           — recovery from interruptions / bugs
+      ── visualize        — browse + render
+      ── settings         — config: language, registered paths
+
+    Logs gets its own submenu inline (already had one internally).
+    """
     return [
+        # ── direct actions (most common) ────────────────────
         _menu_choice("menu.ingest",       "menu.ingest.hint",     "i"),
         _menu_choice("menu.snapshot",     "menu.snapshot.hint",   "s"),
         _menu_choice("menu.list",         "menu.list.hint",       "l"),
         _menu_choice("menu.restore",      "menu.restore.hint",    "x"),
-        _menu_choice("menu.delete",       "menu.delete.hint",     "D"),
         _menu_choice("menu.diff",         "menu.diff.hint",       "d"),
         _menu_choice("menu.browse",       "menu.browse.hint",     "b"),
-        _menu_choice("menu.thumbnail",    "menu.thumbnail.hint",  "t"),
+        # ── grouped submenus ────────────────────────────────
+        _menu_choice("menu.health",       "menu.health.hint",     "H"),
+        _menu_choice("menu.repair_tools", "menu.repair_tools.hint","R"),
         _menu_choice("menu.logs",         "menu.logs.hint",       "L"),
+        _menu_choice("menu.settings",     "menu.settings.hint",   "S"),
+        # ── escape hatch ────────────────────────────────────
+        _menu_choice("menu.quit",         None,                   "q"),
+    ]
+
+
+def _build_health_submenu() -> list:
+    """Vault-health diagnostics + housekeeping."""
+    return [
+        _menu_choice("menu.fsck",         "menu.fsck.hint",       "f"),
         _menu_choice("menu.verify",       "menu.verify.hint",     "v"),
         _menu_choice("menu.verify_rt",    "menu.verify_rt.hint",  "V"),
         _menu_choice("menu.verify_dirs",  "menu.verify_dirs.hint","F"),
-        _menu_choice("menu.fsck",         "menu.fsck.hint",       "f"),
-        _menu_choice("menu.repair_ts",    "menu.repair_ts.hint",  "r"),
-        _menu_choice("menu.retime",       "menu.retime.hint",     "R"),
         _menu_choice("menu.gc",           "menu.gc.hint",         "g"),
-        _menu_choice("menu.lang",         "menu.lang.hint",       "@"),
-        _menu_choice("menu.quit",         None,                   "q"),
+        _menu_choice("menu.thumbnail",    "menu.thumbnail.hint",  "t"),
+        _menu_choice("menu.back",         None,                   "_back"),
     ]
+
+
+def _build_repair_submenu() -> list:
+    """Recovery / migration tools — used after a Ctrl+C, an upgrade, or
+    when fixing data created by an older buggy version."""
+    return [
+        _menu_choice("menu.repair_ts",    "menu.repair_ts.hint",  "r"),
+        _menu_choice("menu.migrate_mca",  "menu.migrate_mca.hint","M"),
+        _menu_choice("menu.retime",       "menu.retime.hint",     "T"),
+        _menu_choice("menu.delete",       "menu.delete.hint",     "D"),
+        _menu_choice("menu.back",         None,                   "_back"),
+    ]
+
+
+def _build_settings_submenu() -> list:
+    """Persistent user config: language, registered vaults + source paths."""
+    return [
+        _menu_choice("menu.lang",         "menu.lang.hint",       "@"),
+        _menu_choice("menu.repos",        "menu.repos.hint",      "p"),
+        _menu_choice("menu.sources",      "menu.sources.hint",    "u"),
+        _menu_choice("menu.back",         None,                   "_back"),
+    ]
+
+
+def submenu(console, title: str, choices: list) -> str | None:
+    """Render a submenu picker. Returns the chosen value, or None if the
+    user picked "back" / cancelled."""
+    answer = questionary.select(
+        title,
+        choices=choices,
+        default=choices[0],
+        style=_QSTYLE,
+        instruction=t("prompt.menu_keys"),
+    ).ask()
+    if answer is None or answer == "_back":
+        return None
+    return answer
 
 
 def render_menu_guide(console: Console) -> None:

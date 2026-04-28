@@ -21,6 +21,9 @@ from ..store.ingest import IngestResult
 from .detect import EnvironmentSummary, detect_environment, summarize_repo
 from .i18n import t
 from .ui import (
+    _build_health_submenu,
+    _build_repair_submenu,
+    _build_settings_submenu,
     choose_one,
     confirm,
     fmt_bytes,
@@ -31,6 +34,7 @@ from .ui import (
     render_environment,
     render_op_intro,
     select_archives,
+    submenu,
 )
 
 
@@ -109,6 +113,7 @@ def run_wizard(console: Console | None = None) -> int:
             console.print(f"[dim]{_t('prompt.bye')}[/dim]")
             return 0
         try:
+            # Top-level direct actions
             if choice == "i":
                 run_ingest_flow(console, env)
             elif choice == "s":
@@ -117,32 +122,19 @@ def run_wizard(console: Console | None = None) -> int:
                 run_list_flow(console, env)
             elif choice == "x":
                 run_restore_flow(console, env)
-            elif choice == "D":
-                run_delete_flow(console, env)
             elif choice == "d":
                 run_diff_flow(console, env)
             elif choice == "b":
                 run_browse_flow(console, env)
-            elif choice == "t":
-                run_thumbnail_flow(console, env)
             elif choice == "L":
                 run_logs_flow(console, env)
-            elif choice == "v":
-                run_verify_flow(console, env)
-            elif choice == "V":
-                run_verify_roundtrip_flow(console, env)
-            elif choice == "F":
-                run_verify_folders_flow(console, env)
-            elif choice == "f":
-                run_fsck_flow(console, env)
-            elif choice == "r":
-                run_repair_timestamps_flow(console, env)
+            # Submenu groups
+            elif choice == "H":
+                _dispatch_health_submenu(console, env)
             elif choice == "R":
-                run_retime_flow(console, env)
-            elif choice == "g":
-                run_gc_flow(console, env)
-            elif choice == "@":
-                run_language_flow(console, env)
+                _dispatch_repair_submenu(console, env)
+            elif choice == "S":
+                _dispatch_settings_submenu(console, env)
         except KeyboardInterrupt:
             console.print(f"\n[yellow]{_t('prompt.cancel')}[/yellow]")
         except Exception as e:
@@ -914,3 +906,184 @@ def run_language_flow(console: Console, env: EnvironmentSummary):
         console.print(i18n.t(
             "lang.changed", locale=chosen.native_name, path=saved_path,
         ))
+
+
+# ---- submenu dispatchers ---------------------------------------------------
+
+def _dispatch_health_submenu(console: Console, env: EnvironmentSummary):
+    """Vault health diagnostics + housekeeping."""
+    choice = submenu(console, t("menu.health"), _build_health_submenu())
+    if choice is None:
+        return
+    if choice == "f":
+        run_fsck_flow(console, env)
+    elif choice == "v":
+        run_verify_flow(console, env)
+    elif choice == "V":
+        run_verify_roundtrip_flow(console, env)
+    elif choice == "F":
+        run_verify_folders_flow(console, env)
+    elif choice == "g":
+        run_gc_flow(console, env)
+    elif choice == "t":
+        run_thumbnail_flow(console, env)
+
+
+def _dispatch_repair_submenu(console: Console, env: EnvironmentSummary):
+    """Recovery / migration tools."""
+    choice = submenu(console, t("menu.repair_tools"), _build_repair_submenu())
+    if choice is None:
+        return
+    if choice == "r":
+        run_repair_timestamps_flow(console, env)
+    elif choice == "M":
+        run_migrate_mca_flow(console, env)
+    elif choice == "T":
+        run_retime_flow(console, env)
+    elif choice == "D":
+        run_delete_flow(console, env)
+
+
+def _dispatch_settings_submenu(console: Console, env: EnvironmentSummary):
+    """Persistent user config."""
+    choice = submenu(console, t("menu.settings"), _build_settings_submenu())
+    if choice is None:
+        return
+    if choice == "@":
+        run_language_flow(console, env)
+    elif choice == "p":
+        run_repos_flow(console, env)
+    elif choice == "u":
+        run_sources_flow(console, env)
+
+
+# ---- new flow: migrate-mca-files ------------------------------------------
+
+def run_migrate_mca_flow(console: Console, env: EnvironmentSummary):
+    """Move entities/*.mca + poi/*.mca from whole-file dedup to chunk-
+    level dedup using bytes already in the file pool."""
+    render_op_intro(
+        console, t("menu.migrate_mca"),
+        t("menu.migrate_mca.hint"),
+        expects=t("flow.repair_ts.expects"),
+    )
+    repo = _pick_or_create_repo(console, env)
+
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("migrate", total=None)
+        cb = _make_phase_cb(progress, task, prefix="migrate")
+        dry = repo.migrate_mca_files_to_chunks(dry_run=True, progress_cb=cb)
+    console.print(f"[bold]{dry.summary()}[/bold]")
+
+    if dry.mca_files_total == 0:
+        console.print(f"[green]{t('flow.repair_ts.clean')}[/green]")
+        return
+
+    if not confirm(console, t("flow.repair_ts.confirm_apply"), default=False):
+        console.print(f"[dim]{t('flow.repair_ts.cancelled')}[/dim]")
+        return
+
+    progress = make_progress(console)
+    with progress:
+        task = progress.add_task("migrate", total=None)
+        cb = _make_phase_cb(progress, task, prefix="migrate")
+        result = repo.migrate_mca_files_to_chunks(dry_run=False, progress_cb=cb)
+    console.print(f"[green]{result.summary()}[/green]")
+
+
+# ---- new flows: repo + source path registry management -------------------
+
+def run_repos_flow(console: Console, env: EnvironmentSummary):
+    """List / add / remove registered vaults."""
+    from . import config as _cfg
+    render_op_intro(
+        console, t("menu.repos"),
+        t("menu.repos.hint"),
+        expects="A vault path (when adding).",
+    )
+    repos = _cfg.list_repos()
+    if repos:
+        console.print(f"\n[bold]{t('menu.repos')}:[/bold]")
+        for r in repos:
+            label = f"  [{r.label}]" if r.label else ""
+            marker = "" if r.path.is_dir() else "  [dim](missing)[/dim]"
+            console.print(f"  {r.path}{label}{marker}")
+    else:
+        console.print(f"[dim](none registered yet)[/dim]")
+    actions = [
+        f"add  │ {t('menu.repos.hint')}",
+        f"remove │ unregister an existing entry",
+        t("prompt.logs.action.back"),
+    ]
+    pick = choose_one(console, t("prompt.logs.action"), actions)
+    if pick == actions[2]:
+        return
+    if pick == actions[0]:
+        path = prompt_path(console, t("prompt.repo_path"),
+                           default=Path.cwd(), must_exist=False)
+        label = console.input(t("prompt.label_blank")).strip()
+        added = _cfg.add_repo(path, label=label)
+        if added:
+            console.print(f"[green]registered:[/green] {Path(path).resolve()}")
+        else:
+            console.print(f"[dim]already registered[/dim]")
+        return
+    if pick == actions[1]:
+        if not repos:
+            console.print(f"[dim](nothing to remove)[/dim]")
+            return
+        options = [str(r.path) for r in repos]
+        target = choose_one(console, "Which to remove?", options)
+        if target is None:
+            return
+        if _cfg.remove_repo(target):
+            console.print(f"[green]removed:[/green] {target}")
+
+
+def run_sources_flow(console: Console, env: EnvironmentSummary):
+    """List / add / remove registered source-archive directories."""
+    from . import config as _cfg
+    render_op_intro(
+        console, t("menu.sources"),
+        t("menu.sources.hint"),
+        expects="A directory path containing backup archives (when adding).",
+    )
+    sources = _cfg.list_source_paths()
+    if sources:
+        console.print(f"\n[bold]{t('menu.sources')}:[/bold]")
+        for s in sources:
+            label = f"  [{s.label}]" if s.label else ""
+            marker = "" if s.path.is_dir() else "  [dim](missing)[/dim]"
+            console.print(f"  {s.path}{label}{marker}")
+    else:
+        console.print(f"[dim](none registered yet)[/dim]")
+    actions = [
+        f"add  │ {t('menu.sources.hint')}",
+        f"remove │ unregister an existing entry",
+        t("prompt.logs.action.back"),
+    ]
+    pick = choose_one(console, t("prompt.logs.action"), actions)
+    if pick == actions[2]:
+        return
+    if pick == actions[0]:
+        path = prompt_path(console, t("prompt.extra_source"),
+                           default=Path.cwd(), must_exist=False)
+        label = console.input(t("prompt.label_blank")).strip()
+        added = _cfg.add_source_path(path, label=label)
+        if added:
+            console.print(f"[green]registered:[/green] {Path(path).resolve()}")
+        else:
+            console.print(f"[dim]already registered[/dim]")
+        return
+    if pick == actions[1]:
+        if not sources:
+            console.print(f"[dim](nothing to remove)[/dim]")
+            return
+        options = [str(s.path) for s in sources]
+        target = choose_one(console, "Which to remove?", options)
+        if target is None:
+            return
+        if _cfg.remove_source_path(target):
+            console.print(f"[green]removed:[/green] {target}")
+
