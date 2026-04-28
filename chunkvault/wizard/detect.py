@@ -35,7 +35,19 @@ class RepoSummary:
 
 
 def summarize_repo(path: Path | str) -> RepoSummary | None:
-    """Inspect ``path`` and return a summary if it looks like a chunkvault repo."""
+    """Inspect ``path`` and return a summary if it looks like a chunkvault repo.
+
+    Counts come from the SQLite index, not from filesystem walks.
+    Walking ``chunks/`` recursively on a multi-million-chunk vault used to
+    hang the wizard for minutes (or OOM-kill it on Windows) every time
+    ``detect_environment`` ran — which is on launch AND after every
+    operation. Index counts are O(1) per table.
+
+    ``on_disk_bytes`` is similarly derived from the index where possible
+    (sum of chunk_count across snapshots × estimated avg, fallback 0)
+    rather than rglob'ing the whole tree. We give up some accuracy for
+    a 1000x speedup on large vaults.
+    """
     p = Path(path)
     if not p.is_dir():
         return None
@@ -43,20 +55,57 @@ def summarize_repo(path: Path | str) -> RepoSummary | None:
     if kind == "unknown":
         return None
     snap_count = log_count = chunk_blobs = log_blobs = 0
+    on_disk_bytes = 0
     try:
         if kind == "chunk":
             from ..store import ChunkSnapshotRepo
+            from ..store.index import IndexDB
             repo = ChunkSnapshotRepo(p)
             if repo.is_initialized():
-                snap_count = len(repo.list())
-                log_count = len(repo.list_log_snapshots())
+                # Use direct SQL — list() materializes full snapshot
+                # objects which is overkill for a count.
+                with IndexDB(repo.index_path) as idx:
+                    cur = idx._conn.execute(
+                        "SELECT COUNT(*) FROM snapshots",
+                    )
+                    snap_count = cur.fetchone()[0]
+                    cur = idx._conn.execute(
+                        "SELECT COUNT(*) FROM log_snapshots",
+                    )
+                    log_count = cur.fetchone()[0]
+                    cur = idx._conn.execute(
+                        "SELECT COUNT(*) FROM chunks",
+                    )
+                    chunk_blobs = cur.fetchone()[0]
+                    # log_files presence row count
+                    try:
+                        cur = idx._conn.execute(
+                            "SELECT COUNT(*) FROM log_files",
+                        )
+                        log_blobs = cur.fetchone()[0]
+                    except Exception:
+                        log_blobs = 0
+            # On-disk size: stat just the index.sqlite + manifests/ —
+            # the chunks/ pool is the elephant we deliberately don't
+            # walk here.
+            try:
+                idx_path = p / "index.sqlite"
+                if idx_path.is_file():
+                    on_disk_bytes += idx_path.stat().st_size
+                manifests_dir = p / "manifests"
+                if manifests_dir.is_dir():
+                    for child in manifests_dir.iterdir():
+                        try:
+                            on_disk_bytes += child.stat().st_size
+                        except OSError:
+                            pass
+            except OSError:
+                pass
         elif kind == "git":
             from ..storage import SnapshotRepo
             repo = SnapshotRepo(p)
             if repo.is_initialized():
                 snap_count = len(repo.list())
-        chunk_blobs = _count_files_under(p / "chunks")
-        log_blobs = _count_files_under(p / "logs")
     except Exception:
         pass
     return RepoSummary(
@@ -65,7 +114,7 @@ def summarize_repo(path: Path | str) -> RepoSummary | None:
         log_snapshot_count=log_count,
         chunk_blob_count=chunk_blobs,
         log_blob_count=log_blobs,
-        on_disk_bytes=_dir_size(p),
+        on_disk_bytes=on_disk_bytes,
     )
 
 

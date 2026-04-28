@@ -139,7 +139,18 @@ def run_wizard(console: Console | None = None) -> int:
             console.print(f"\n[yellow]{_t('prompt.cancel')}[/yellow]")
         except Exception as e:
             console.print(f"[red]{_t('prompt.error')}[/red] {e}")
-        env = detect_environment()
+        # Refresh env between iterations so newly-created vaults / changed
+        # source paths show up in the next menu cycle. Wrapped in its own
+        # try because detect_environment touches index.sqlite + scans the
+        # filesystem; any transient error here (lock, AV scan, perm) used
+        # to kill the wizard. Now we keep the previous env on failure.
+        try:
+            env = detect_environment()
+        except Exception as e:
+            console.print(
+                f"[dim red]({_t('prompt.error')} env refresh: {e}; "
+                f"keeping previous environment.)[/dim red]"
+            )
 
 
 # ---- repo helper ----------------------------------------------------------
